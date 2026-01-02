@@ -111,21 +111,86 @@ Config: dim=64, n_layers=4, n_heads=4, max_tokens=20, 5 concurrent requests
 **METAL (Apple Silicon)**
 | Benchmark | Tokens/sec | Requests/sec |
 |-----------|------------|--------------|
-| single_request | 2.2 | 0.11 |
-| sequential_5 | 4.5 | 0.23 |
-| concurrent_5 | 4.7 | 0.23 |
+| single_request | 2.8 | 0.14 |
+| sequential_5 | 4.3 | 0.21 |
+| concurrent_5 | 4.4 | 0.22 |
 
-Concurrent vs Sequential: **1.04x** speedup
+Concurrent vs Sequential: **1.02x** speedup
 
 **CPU**
 | Benchmark | Tokens/sec | Requests/sec |
 |-----------|------------|--------------|
-| single_request | 1.1 | 0.05 |
-| sequential_5 | 3.6 | 0.18 |
-| concurrent_5 | 5.1 | 0.25 |
+| single_request | 1.8 | 0.09 |
+| sequential_5 | 3.9 | 0.20 |
+| concurrent_5 | 4.7 | 0.23 |
 
-Concurrent vs Sequential: **1.39x** speedup
+Concurrent vs Sequential: **1.19x** speedup
 
 Note: Current implementation processes one sequence per step.
 Real batching gains will come in Phase 4 with batched forward passes.
+
+### Memory Usage (Phase 3)
+
+Run: `python -m benchmarks.bench_memory`
+
+Model: dim=64, layers=4, kv_heads=4, head_dim=16
+Theoretical KV memory per token: 2.0 KB (2 × layers × kv_heads × head_dim × 4 bytes)
+
+| Sequences | Tokens | KV Cache Memory | Bytes/Token |
+|-----------|--------|-----------------|-------------|
+| 1 | 18 | 36.0 KB | 2048 |
+| 2 | 36 | 72.0 KB | 2048 |
+| 5 | 90 | 180.0 KB | 2048 |
+| 10 | 144 | 288.0 KB | 2048 |
+
+Note: Memory scales linearly with tokens. Phase 4 paged attention will add
+block-based allocation for better memory management under pressure.
+
+### Latency (Phase 3)
+
+Run: `python -m benchmarks.bench_latency`
+
+**METAL**
+| Prompt Len | Tokens | TTFT (ms) | TPOT (ms) | E2E (ms) |
+|------------|--------|-----------|-----------|----------|
+| 3 | 10 | 176 | 242 | 2356 |
+| 17 | 10 | 380 | 328 | 3335 |
+| 51 | 10 | 873 | 756 | 7673 |
+
+Summary: TTFT=98ms, TPOT=191ms, E2E=2774ms (15 tokens)
+
+**CPU**
+| Prompt Len | Tokens | TTFT (ms) | TPOT (ms) | E2E (ms) |
+|------------|--------|-----------|-----------|----------|
+| 3 | 10 | 238 | 425 | 4064 |
+| 17 | 10 | 465 | 548 | 5401 |
+| 51 | 10 | 1071 | 1184 | 11722 |
+
+Summary: TTFT=95ms, TPOT=180ms, E2E=2617ms (15 tokens)
+
+### Scalability (Phase 3)
+
+Run: `python -m benchmarks.bench_scalability`
+
+**METAL - Throughput vs Concurrent Requests**
+| Requests | Tok/sec | Efficiency |
+|----------|---------|------------|
+| 1 | 4.3 | 100% |
+| 2 | 5.5 | 64% |
+| 4 | 6.1 | 35% |
+| 8 | 5.5 | 16% |
+| 16 | 4.6 | 7% |
+
+**CPU - Throughput vs Concurrent Requests**
+| Requests | Tok/sec | Efficiency |
+|----------|---------|------------|
+| 1 | 3.8 | 100% |
+| 2 | 6.1 | 80% |
+| 4 | 5.8 | 38% |
+| 8 | 5.4 | 18% |
+| 16 | 4.5 | 7% |
+
+Note: Efficiency = (actual throughput) / (baseline × n_requests).
+Drops sharply because we process one sequence per step.
+Phase 4 batched forward passes should maintain higher efficiency at scale.
 

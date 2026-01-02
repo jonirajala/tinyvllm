@@ -170,11 +170,12 @@ def run_benchmarks():
         "Another one",
     ]
 
-    # Warmup
-    print("Warming up...")
-    engine = LLMEngine(model, tokenizer)
-    engine.add_request("warmup", SamplingParams(max_tokens=5, temperature=0.0))
-    list(engine.run())
+    # Warmup - multiple runs to ensure JIT is warmed
+    print("Warming up (3 runs)...")
+    for _ in range(3):
+        engine = LLMEngine(model, tokenizer)
+        engine.add_request("warmup prompt", SamplingParams(max_tokens=10, temperature=0.0))
+        list(engine.run())
 
     results = []
 

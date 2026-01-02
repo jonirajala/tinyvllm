@@ -124,3 +124,23 @@ class KVCache:
                 del self.k_cache[layer_idx][seq_id]
             if seq_id in self.v_cache[layer_idx]:
                 del self.v_cache[layer_idx][seq_id]
+
+    def get_memory_bytes(self) -> int:
+        """Calculate total memory used by KV cache in bytes."""
+        bytes_per_element = 4  # float32
+        total = 0
+        for layer_idx in range(self.num_layers):
+            for seq_id in self.k_cache[layer_idx]:
+                n_tokens = len(self.k_cache[layer_idx][seq_id])
+                # K + V per token: 2 * n_tokens * n_kv_heads * head_dim * bytes
+                total += 2 * n_tokens * self.n_kv_heads * self.head_dim * bytes_per_element
+        return total
+
+    def get_num_tokens(self) -> int:
+        """Get total tokens stored across all sequences."""
+        total = 0
+        for layer_idx in range(self.num_layers):
+            for seq_id in self.k_cache[layer_idx]:
+                total += len(self.k_cache[layer_idx][seq_id])
+        # Divide by num_layers since tokens are duplicated per layer
+        return total // self.num_layers if self.num_layers > 0 else 0
