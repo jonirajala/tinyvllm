@@ -71,8 +71,14 @@ def run_memory_benchmark():
                 break
             engine.step()
 
-        mem_bytes = engine.kv_cache.get_memory_bytes()
-        n_tokens = engine.kv_cache.get_num_tokens()
+        # Phase 4: Count tokens from BlockManager context lengths
+        n_tokens = sum(
+            engine.block_manager.get_context_length(seq_id)
+            for seq_id in engine.block_manager.block_tables.keys()
+        )
+        # Memory is the allocated blocks * block_size * per-token storage
+        num_used_blocks = engine.block_manager.blocks_per_gpu - engine.block_manager.get_num_free_blocks()
+        mem_bytes = num_used_blocks * engine.block_manager.block_size * bytes_per_token
         bytes_per = mem_bytes // n_tokens if n_tokens > 0 else 0
         print(f"| {n_seqs:9} | {n_tokens:6} | {format_bytes(mem_bytes):15} | {bytes_per:11} |")
 

@@ -1,4 +1,4 @@
-"""Tests for LLaMA model components."""
+"""Tests for LLaMA model components (Phase 4)."""
 
 import pytest
 import math
@@ -15,6 +15,7 @@ from tinyvllm.model.llama import (
 )
 from tinyvllm.model.weights import LlamaConfig
 from tinyvllm.core.kv_cache import KVCache
+from tinyvllm.core.block_manager import BlockManager
 
 
 # Small config for fast tests
@@ -30,16 +31,22 @@ def small_config():
     )
 
 
-def create_test_kv_cache(config):
-    """Create a KVCache for testing."""
-    return KVCache(
+def create_test_components(config, num_blocks=10, block_size=16):
+    """Create BlockManager and KVCache for testing."""
+    block_manager = BlockManager(
+        num_gpus=1,
+        blocks_per_gpu=num_blocks,
+        block_size=block_size,
+    )
+    kv_cache = KVCache(
         num_layers=config.n_layers,
-        num_blocks=10,
-        block_size=16,
+        num_blocks=num_blocks,
+        block_size=block_size,
         n_kv_heads=config.n_kv_heads,
         head_dim=config.head_dim,
         dtype=dtypes.float32,
     )
+    return block_manager, kv_cache
 
 
 class TestRMSNorm:
@@ -176,55 +183,34 @@ class TestAttention:
         """Output shape should be [batch, seq, dim]."""
         config = small_config()
         attn = Attention(config)
-        kv_cache = create_test_kv_cache(config)
-
-        batch, seq = 1, 8  # batch must be 1 with kv_cache
-        x = Tensor.randn(batch, seq, config.dim)
-        cos, sin = precompute_freqs_cis(config.head_dim, seq)
-
-        kv_cache.allocate_sequence(seq_id=0)
-        out = attn(x, cos, sin, kv_cache=kv_cache, layer_idx=0, seq_id=0)
-
-        assert out.shape == (batch, seq, config.dim)
-
-    def test_with_kv_cache(self):
-        """Should work with KVCache."""
-        config = small_config()
-        attn = Attention(config)
-        kv_cache = create_test_kv_cache(config)
+        block_manager, kv_cache = create_test_components(config)
 
         batch, seq = 1, 8
         x = Tensor.randn(batch, seq, config.dim)
         cos, sin = precompute_freqs_cis(config.head_dim, seq)
 
-        kv_cache.allocate_sequence(seq_id=0)
-        out = attn(x, cos, sin, kv_cache=kv_cache, layer_idx=0, seq_id=0)
+        # Allocate sequence in BlockManager
+        block_manager.allocate_sequence(seq_id=0, num_tokens=seq)
+        out = attn(x, cos, sin, kv_cache=kv_cache, block_manager=block_manager,
+                   layer_idx=0, seq_id=0, start_pos=0)
 
         assert out.shape == (batch, seq, config.dim)
-        # KV cache should have stored the tokens
-        assert kv_cache.get_context_length(layer_idx=0, seq_id=0) == seq
 
-    def test_kv_cache_grows(self):
-        """KVCache should grow with each call."""
+    def test_with_kv_cache(self):
+        """Should work with BlockManager and KVCache."""
         config = small_config()
         attn = Attention(config)
-        kv_cache = create_test_kv_cache(config)
+        block_manager, kv_cache = create_test_components(config)
 
-        batch = 1
-        x1 = Tensor.randn(batch, 4, config.dim)  # First 4 tokens
-        x2 = Tensor.randn(batch, 1, config.dim)  # Next token
+        batch, seq = 1, 8
+        x = Tensor.randn(batch, seq, config.dim)
+        cos, sin = precompute_freqs_cis(config.head_dim, seq)
 
-        cos, sin = precompute_freqs_cis(config.head_dim, 10)
+        block_manager.allocate_sequence(seq_id=0, num_tokens=seq)
+        out = attn(x, cos, sin, kv_cache=kv_cache, block_manager=block_manager,
+                   layer_idx=0, seq_id=0, start_pos=0)
 
-        kv_cache.allocate_sequence(seq_id=0)
-
-        # First pass
-        attn(x1, cos[:4], sin[:4], kv_cache=kv_cache, layer_idx=0, seq_id=0, start_pos=0)
-        assert kv_cache.get_context_length(layer_idx=0, seq_id=0) == 4
-
-        # Second pass
-        attn(x2, cos[4:5], sin[4:5], kv_cache=kv_cache, layer_idx=0, seq_id=0, start_pos=4)
-        assert kv_cache.get_context_length(layer_idx=0, seq_id=0) == 5
+        assert out.shape == (batch, seq, config.dim)
 
 
 class TestFeedForward:
@@ -258,28 +244,30 @@ class TestTransformerBlock:
         """Output shape should match input shape."""
         config = small_config()
         block = TransformerBlock(config)
-        kv_cache = create_test_kv_cache(config)
+        block_manager, kv_cache = create_test_components(config)
 
-        batch, seq = 1, 8  # batch must be 1 with kv_cache
+        batch, seq = 1, 8
         x = Tensor.randn(batch, seq, config.dim)
         cos, sin = precompute_freqs_cis(config.head_dim, seq)
 
-        kv_cache.allocate_sequence(seq_id=0)
-        out = block(x, cos, sin, kv_cache=kv_cache, layer_idx=0, seq_id=0)
+        block_manager.allocate_sequence(seq_id=0, num_tokens=seq)
+        out = block(x, cos, sin, kv_cache=kv_cache, block_manager=block_manager,
+                    layer_idx=0, seq_id=0, start_pos=0)
         assert out.shape == x.shape
 
     def test_residual_connection(self):
         """Output should include residual from input."""
         config = small_config()
         block = TransformerBlock(config)
-        kv_cache = create_test_kv_cache(config)
+        block_manager, kv_cache = create_test_components(config)
 
         batch, seq = 1, 4
         x = Tensor.randn(batch, seq, config.dim)
         cos, sin = precompute_freqs_cis(config.head_dim, seq)
 
-        kv_cache.allocate_sequence(seq_id=0)
-        out = block(x, cos, sin, kv_cache=kv_cache, layer_idx=0, seq_id=0)
+        block_manager.allocate_sequence(seq_id=0, num_tokens=seq)
+        out = block(x, cos, sin, kv_cache=kv_cache, block_manager=block_manager,
+                    layer_idx=0, seq_id=0, start_pos=0)
 
         # Output should be different from input but correlated
         x_list = x.realize().tolist()
@@ -288,81 +276,57 @@ class TestTransformerBlock:
         # They should be different
         assert x_list != out_list
 
-    def test_with_kv_cache(self):
-        """Should work with KVCache."""
-        config = small_config()
-        block = TransformerBlock(config)
-        kv_cache = create_test_kv_cache(config)
-
-        x = Tensor.randn(1, 4, config.dim)
-        cos, sin = precompute_freqs_cis(config.head_dim, 4)
-
-        kv_cache.allocate_sequence(seq_id=0)
-        out = block(x, cos, sin, kv_cache=kv_cache, layer_idx=0, seq_id=0)
-
-        assert out.shape == x.shape
-        assert kv_cache.get_context_length(layer_idx=0, seq_id=0) == 4
-
 
 class TestLlama:
     def test_output_shape(self):
         """Output logits should have shape [batch, seq, vocab_size]."""
         config = small_config()
         model = Llama(config)
-        kv_cache = model.create_kv_cache()
+        block_manager, kv_cache = create_test_components(config)
 
         batch, seq = 1, 8
         tokens = Tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
 
-        kv_cache.allocate_sequence(seq_id=0)
-        logits = model(tokens, kv_cache=kv_cache, seq_id=0)
+        block_manager.allocate_sequence(seq_id=0, num_tokens=seq)
+        logits = model(tokens, kv_cache=kv_cache, block_manager=block_manager, seq_id=0)
         assert logits.shape == (batch, seq, config.vocab_size)
-
-    def test_with_kv_cache(self):
-        """Should work with KVCache and cache all layers."""
-        config = small_config()
-        model = Llama(config)
-        kv_cache = model.create_kv_cache()
-
-        tokens = Tensor([[1, 2, 3, 4]])
-        kv_cache.allocate_sequence(seq_id=0)
-        logits = model(tokens, kv_cache=kv_cache, seq_id=0)
-
-        assert logits.shape == (1, 4, config.vocab_size)
-        # All layers should have cached tokens
-        for layer_idx in range(config.n_layers):
-            assert kv_cache.get_context_length(layer_idx, seq_id=0) == 4
 
     def test_incremental_generation(self):
         """Should support incremental generation with KV cache."""
         config = small_config()
         model = Llama(config)
-        kv_cache = model.create_kv_cache()
+        block_manager, kv_cache = create_test_components(config, num_blocks=20)
 
-        kv_cache.allocate_sequence(seq_id=0)
+        # Allocate enough blocks for prompt + generation
+        prompt_len = 4
+        max_gen = 3
+        block_manager.allocate_sequence(seq_id=0, num_tokens=prompt_len + max_gen)
 
         # First pass: process prompt
         prompt = Tensor([[1, 2, 3, 4]])
-        logits1 = model(prompt, start_pos=0, kv_cache=kv_cache, seq_id=0)
+        logits1 = model(prompt, start_pos=0, kv_cache=kv_cache, block_manager=block_manager, seq_id=0)
         assert logits1.shape == (1, 4, config.vocab_size)
+
+        # Verify context length grew
+        assert block_manager.get_context_length(seq_id=0) == 4
 
         # Second pass: generate next token
         next_token = Tensor([[5]])
-        logits2 = model(next_token, start_pos=4, kv_cache=kv_cache, seq_id=0)
+        logits2 = model(next_token, start_pos=4, kv_cache=kv_cache, block_manager=block_manager, seq_id=0)
         assert logits2.shape == (1, 1, config.vocab_size)
 
-        # KV cache should have grown
-        assert kv_cache.get_context_length(layer_idx=0, seq_id=0) == 5
+        # Context length should have grown
+        assert block_manager.get_context_length(seq_id=0) == 5
 
     def test_single_token(self):
         """Should handle single token input."""
         config = small_config()
         model = Llama(config)
-        kv_cache = model.create_kv_cache()
+        block_manager, kv_cache = create_test_components(config)
 
         tokens = Tensor([[42]])
-        kv_cache.allocate_sequence(seq_id=0)
-        logits = model(tokens, kv_cache=kv_cache, seq_id=0)
+        block_manager.allocate_sequence(seq_id=0, num_tokens=1)
+        logits = model(tokens, kv_cache=kv_cache, block_manager=block_manager, seq_id=0)
 
         assert logits.shape == (1, 1, config.vocab_size)
 
@@ -370,13 +334,13 @@ class TestLlama:
         """Earlier positions should not attend to later positions."""
         config = small_config()
         model = Llama(config)
-        kv_cache = model.create_kv_cache()
+        block_manager, kv_cache = create_test_components(config)
 
-        kv_cache.allocate_sequence(seq_id=0)
+        block_manager.allocate_sequence(seq_id=0, num_tokens=5)
 
         # This is implicitly tested by the model working correctly
         tokens = Tensor([[1, 2, 3, 4, 5]])
-        logits = model(tokens, kv_cache=kv_cache, seq_id=0)
+        logits = model(tokens, kv_cache=kv_cache, block_manager=block_manager, seq_id=0)
 
         # Should produce valid output
         assert logits.shape == (1, 5, config.vocab_size)

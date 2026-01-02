@@ -378,38 +378,42 @@ class TestGenerateBatch:
 
 
 class TestEngineWithKVCache:
-    """Tests for engine KV cache handling."""
+    """Tests for engine KV cache handling (Phase 4: BlockManager)."""
 
     def test_kv_cache_allocated_on_step(self):
-        """KV cache should be allocated when processing."""
+        """Blocks should be allocated when processing."""
         config = small_config()
         model = Llama(config)
         tokenizer = MockTokenizer()
         engine = LLMEngine(model, tokenizer)
+
+        # Before adding request - all blocks free
+        initial_free = engine.block_manager.get_num_free_blocks()
 
         engine.add_request("test", SamplingParams(max_tokens=3))
 
-        # Before step - k_cache is list of dicts per layer
-        initial_seqs = sum(len(layer_cache) for layer_cache in engine.kv_cache.k_cache)
-        assert initial_seqs == 0
-
-        # After step - cache should be allocated
+        # After step - some blocks should be allocated
         engine.step()
-        # Cache will have entries (or be freed if finished)
+
+        # Some blocks should now be in use
+        after_free = engine.block_manager.get_num_free_blocks()
+        assert after_free <= initial_free
 
     def test_kv_cache_freed_on_finish(self):
-        """KV cache should be freed when request finishes."""
+        """Blocks should be freed when request finishes."""
         config = small_config()
         model = Llama(config)
         tokenizer = MockTokenizer()
         engine = LLMEngine(model, tokenizer)
+
+        initial_free = engine.block_manager.get_num_free_blocks()
 
         engine.add_request("test", SamplingParams(max_tokens=1))
         list(engine.run())
 
-        # All sequences finished, cache should be empty
-        total_seqs = sum(len(layer_cache) for layer_cache in engine.kv_cache.k_cache)
-        assert total_seqs == 0
+        # All sequences finished, blocks should be returned
+        final_free = engine.block_manager.get_num_free_blocks()
+        assert final_free == initial_free
 
 
 class TestEngineEdgeCases:

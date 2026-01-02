@@ -1,10 +1,7 @@
 """Paged Attention Implementation.
 
-Phase 2: Simplified implementation that works with list-based KVCache.
-K/V is already contiguous after read_kv(), so no scattered gather needed.
-
-TODO Phase 4: Update to work with block-based KVCache where K/V is scattered
-across pre-allocated block tensors. See docs/phase4_kv_optimization.md
+Phase 4: Block-based KVCache with paged attention.
+Supports both single-sequence and batched decode operations.
 """
 
 from typing import List, Optional
@@ -161,16 +158,12 @@ def paged_attention(
     value: Tensor,
     context_lens: List[int],
     start_pos: int = 0,
-    n_kv_heads: Optional[int] = None,
 ) -> Tensor:
     """
-    Compute attention with paged KV cache (Phase 2 simplified version).
+    Compute attention with paged KV cache.
 
-    In Phase 2, K/V are already contiguous tensors from KVCache.read_kv().
-    This function handles:
-    - GQA head expansion
-    - Causal masking
-    - Padding masking for batched sequences
+    K/V are contiguous tensors from KVCache.read_kv_blocks().
+    Handles GQA head expansion, causal masking, and padding masking.
 
     Args:
         query: [batch, q_len, n_heads, head_dim]
@@ -178,17 +171,9 @@ def paged_attention(
         value: [batch, kv_len, n_kv_heads, head_dim]
         context_lens: Actual length of each sequence (for padding mask)
         start_pos: Starting position for causal mask
-        n_kv_heads: Number of KV heads (for GQA, if different from query heads)
 
     Returns:
         output: [batch, q_len, n_heads, head_dim]
-
-    TODO Phase 4: Accept block_tables and gather K/V from scattered blocks:
-        def paged_attention(query, k_cache, v_cache, block_tables, context_lens, ...):
-            # Gather from blocks
-            k = gather_kv_from_blocks(k_cache, block_tables, ...)
-            v = gather_kv_from_blocks(v_cache, block_tables, ...)
-            # Then compute attention
     """
     batch, q_len, n_heads, head_dim = query.shape
     _, kv_len, kv_heads, _ = key.shape
@@ -218,34 +203,34 @@ def paged_attention(
     return attention(query, key, value, mask=mask)
 
 
-def paged_attention_with_kvcache(
+def paged_attention_with_blocks(
     query: Tensor,
-    kv_cache,  # KVCache instance
-    seq_id: int,
+    kv_cache,  # KVCache instance (block-based)
+    block_table: List[int],
+    context_len: int,
     layer_idx: int,
     start_pos: int = 0,
 ) -> Tensor:
     """
-    Convenience function: compute attention reading from KVCache.
+    Compute attention reading from block-based KVCache.
 
     Args:
         query: [1, q_len, n_heads, head_dim] - single sequence
-        kv_cache: KVCache instance
-        seq_id: Sequence ID to read K/V from
+        kv_cache: Block-based KVCache instance
+        block_table: List of physical block IDs for this sequence
+        context_len: Total number of tokens to read
         layer_idx: Which layer's K/V to use
         start_pos: Starting position for causal mask
 
     Returns:
         output: [1, q_len, n_heads, head_dim]
-
-    This is the main interface for using paged attention in the model.
     """
-    # Read K/V from cache (already contiguous in Phase 2)
-    k, v = kv_cache.read_kv(layer_idx, seq_id)
+    # Read K/V from scattered blocks
+    k, v = kv_cache.read_kv_blocks(layer_idx, block_table, context_len)
 
-    # Add batch dimension if needed
+    # Add batch dimension: [context_len, n_kv_heads, head_dim] -> [1, context_len, n_kv_heads, head_dim]
     if k.ndim == 3:
-        k = k.unsqueeze(0)  # [1, kv_len, n_kv_heads, head_dim]
+        k = k.unsqueeze(0)
         v = v.unsqueeze(0)
 
     kv_len = k.shape[1]
@@ -254,6 +239,34 @@ def paged_attention_with_kvcache(
     return paged_attention(query, k, v, context_lens, start_pos)
 
 
-def gather_kv_from_blocks(block_pool, block_table, context_len, block_size):
-    """Phase 4: Gather K/V from scattered blocks. Not implemented yet."""
-    raise NotImplementedError("Phase 4")
+def batched_paged_attention(
+    queries: List[Tensor],
+    kv_cache,
+    block_tables: List[List[int]],
+    context_lens: List[int],
+    layer_idx: int,
+    start_positions: List[int],
+) -> Tensor:
+    """
+    Batched attention for multiple decode sequences.
+
+    For decode (single token per sequence), compute attention for all sequences
+    and stack results. Each sequence reads from its own block table.
+
+    Args:
+        queries: List of [1, 1, n_heads, head_dim] tensors, one per sequence
+        kv_cache: Block-based KVCache instance
+        block_tables: List of block tables, one per sequence
+        context_lens: Context length for each sequence
+        layer_idx: Which layer
+        start_positions: Start position for each sequence
+
+    Returns:
+        output: [batch, 1, n_heads, head_dim]
+    """
+    outputs = []
+    for q, bt, ctx_len, start_pos in zip(queries, block_tables, context_lens, start_positions):
+        out = paged_attention_with_blocks(q, kv_cache, bt, ctx_len, layer_idx, start_pos)
+        outputs.append(out)
+
+    return Tensor.cat(*outputs, dim=0)

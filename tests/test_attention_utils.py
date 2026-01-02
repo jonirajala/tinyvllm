@@ -1,4 +1,4 @@
-"""Tests for attention_utils (Phase 2 simplified implementation)."""
+"""Tests for attention_utils (Phase 4 block-based implementation)."""
 
 import pytest
 import math
@@ -10,10 +10,10 @@ from tinyvllm.core.attention_utils import (
     repeat_kv,
     attention,
     paged_attention,
-    paged_attention_with_kvcache,
-    gather_kv_from_blocks,
+    paged_attention_with_blocks,
 )
 from tinyvllm.core.kv_cache import KVCache
+from tinyvllm.core.block_manager import BlockManager
 
 
 class TestCreateCausalMask:
@@ -185,134 +185,174 @@ class TestPagedAttention:
         assert out.shape == (batch, 1, n_heads, head_dim)
 
 
-class TestPagedAttentionWithKVCache:
+class TestPagedAttentionWithBlocks:
+    """Phase 4 tests for block-based paged attention."""
+
     def test_basic_usage(self):
-        # Setup cache
+        """Test reading K/V from block-based cache."""
+        n_layers = 2
+        num_blocks = 10
+        block_size = 16
+        n_kv_heads = 4
+        head_dim = 32
+
+        # Create block-based cache
         cache = KVCache(
-            num_layers=2,
-            num_blocks=4,
-            block_size=16,
-            n_kv_heads=4,
-            head_dim=32,
+            num_layers=n_layers,
+            num_blocks=num_blocks,
+            block_size=block_size,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
             dtype=dtypes.float32
         )
 
-        seq_id = 0
-        cache.allocate_sequence(seq_id)
+        # Write some K/V to blocks
+        block_table = [0, 1]  # Using blocks 0 and 1
+        context_len = 5
 
-        # Write some K/V
-        for pos in range(5):
-            k = Tensor.randn(4, 32)
-            v = Tensor.randn(4, 32)
-            cache.write_kv(layer_idx=0, seq_id=seq_id, k=k, v=v)
+        for pos in range(context_len):
+            block_idx = pos // block_size
+            offset = pos % block_size
+            block_id = block_table[block_idx]
+
+            k = Tensor.randn(n_kv_heads, head_dim)
+            v = Tensor.randn(n_kv_heads, head_dim)
+            cache.write_kv(layer_idx=0, block_id=block_id, offset=offset, k=k, v=v)
 
         # Create query
-        query = Tensor.randn(1, 1, 4, 32)  # [batch, q_len, heads, dim]
+        query = Tensor.randn(1, 1, n_kv_heads, head_dim)  # [batch, q_len, heads, dim]
 
         # Run attention
-        out = paged_attention_with_kvcache(
+        out = paged_attention_with_blocks(
             query=query,
             kv_cache=cache,
-            seq_id=seq_id,
+            block_table=block_table,
+            context_len=context_len,
             layer_idx=0,
-            start_pos=4
+            start_pos=context_len - 1,
         )
 
-        assert out.shape == (1, 1, 4, 32)
+        assert out.shape == (1, 1, n_kv_heads, head_dim)
 
     def test_prefill(self):
+        """Test prefill with block-based cache."""
+        n_layers = 2
+        num_blocks = 10
+        block_size = 16
+        n_kv_heads = 4
+        head_dim = 32
+        prompt_len = 10
+
         cache = KVCache(
-            num_layers=2,
-            num_blocks=4,
-            block_size=16,
-            n_kv_heads=4,
-            head_dim=32,
+            num_layers=n_layers,
+            num_blocks=num_blocks,
+            block_size=block_size,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
             dtype=dtypes.float32
         )
 
-        seq_id = 0
-        cache.allocate_sequence(seq_id)
+        # Allocate blocks for prompt
+        block_table = [0]  # Single block can hold 16 tokens
 
         # Write K/V for prefill
-        for pos in range(10):
-            k = Tensor.randn(4, 32)
-            v = Tensor.randn(4, 32)
-            cache.write_kv(layer_idx=0, seq_id=seq_id, k=k, v=v)
+        for pos in range(prompt_len):
+            block_idx = pos // block_size
+            offset = pos % block_size
+            block_id = block_table[block_idx]
+
+            k = Tensor.randn(n_kv_heads, head_dim)
+            v = Tensor.randn(n_kv_heads, head_dim)
+            cache.write_kv(layer_idx=0, block_id=block_id, offset=offset, k=k, v=v)
 
         # Prefill query (all positions)
-        query = Tensor.randn(1, 10, 4, 32)
+        query = Tensor.randn(1, prompt_len, n_kv_heads, head_dim)
 
-        out = paged_attention_with_kvcache(
+        out = paged_attention_with_blocks(
             query=query,
             kv_cache=cache,
-            seq_id=seq_id,
+            block_table=block_table,
+            context_len=prompt_len,
             layer_idx=0,
-            start_pos=0
+            start_pos=0,
         )
 
-        assert out.shape == (1, 10, 4, 32)
-
-
-class TestGatherKVFromBlocks:
-    def test_raises_not_implemented(self):
-        """Phase 2: This function should raise NotImplementedError"""
-        with pytest.raises(NotImplementedError):
-            gather_kv_from_blocks(
-                block_pool=Tensor.zeros(4, 16, 8, 64),
-                block_table=[0, 1, 2],
-                context_len=40,
-                block_size=16
-            )
+        assert out.shape == (1, prompt_len, n_kv_heads, head_dim)
 
 
 class TestIntegration:
+    """Phase 4 integration tests with BlockManager."""
+
     def test_full_generation_flow(self):
-        """Simulate prefill + decode using KVCache and paged attention"""
+        """Simulate prefill + decode using BlockManager and block-based KVCache."""
         n_layers = 2
         n_heads = 4
         n_kv_heads = 4
         head_dim = 32
+        num_blocks = 10
+        block_size = 16
         prompt_len = 5
         decode_steps = 3
 
+        # Create BlockManager and KVCache
+        block_manager = BlockManager(
+            num_gpus=1,
+            blocks_per_gpu=num_blocks,
+            block_size=block_size,
+        )
         cache = KVCache(
             num_layers=n_layers,
-            num_blocks=10,
-            block_size=16,
+            num_blocks=num_blocks,
+            block_size=block_size,
             n_kv_heads=n_kv_heads,
             head_dim=head_dim,
             dtype=dtypes.float32
         )
 
         seq_id = 0
-        cache.allocate_sequence(seq_id)
+        block_manager.allocate_sequence(seq_id, prompt_len)
 
         # Prefill: write K/V for all prompt tokens
-        for layer_idx in range(n_layers):
-            for pos in range(prompt_len):
+        for pos in range(prompt_len):
+            _, block_id, offset = block_manager.get_slot(seq_id)
+            for layer_idx in range(n_layers):
                 k = Tensor.randn(n_kv_heads, head_dim)
                 v = Tensor.randn(n_kv_heads, head_dim)
-                cache.write_kv(layer_idx=layer_idx, seq_id=seq_id, k=k, v=v)
+                cache.write_kv(layer_idx=layer_idx, block_id=block_id, offset=offset, k=k, v=v)
+            block_manager.advance_position(seq_id)
 
         # Prefill attention
+        block_table = block_manager.get_block_table(seq_id)
+        context_len = block_manager.get_context_length(seq_id)
         query = Tensor.randn(1, prompt_len, n_heads, head_dim)
-        out = paged_attention_with_kvcache(query, cache, seq_id, layer_idx=0, start_pos=0)
+        out = paged_attention_with_blocks(
+            query, cache, block_table, context_len, layer_idx=0, start_pos=0
+        )
         assert out.shape == (1, prompt_len, n_heads, head_dim)
 
         # Decode: generate tokens one at a time
         for step in range(decode_steps):
-            current_pos = prompt_len + step
+            current_pos = block_manager.get_context_length(seq_id)
 
             # Write new K/V
+            _, block_id, offset = block_manager.get_slot(seq_id)
             for layer_idx in range(n_layers):
                 k = Tensor.randn(n_kv_heads, head_dim)
                 v = Tensor.randn(n_kv_heads, head_dim)
-                cache.write_kv(layer_idx=layer_idx, seq_id=seq_id, k=k, v=v)
+                cache.write_kv(layer_idx=layer_idx, block_id=block_id, offset=offset, k=k, v=v)
+            block_manager.advance_position(seq_id)
 
             # Decode attention (single token query)
+            block_table = block_manager.get_block_table(seq_id)
+            context_len = block_manager.get_context_length(seq_id)
             query = Tensor.randn(1, 1, n_heads, head_dim)
-            out = paged_attention_with_kvcache(query, cache, seq_id, layer_idx=0, start_pos=current_pos)
+            out = paged_attention_with_blocks(
+                query, cache, block_table, context_len, layer_idx=0, start_pos=current_pos
+            )
             assert out.shape == (1, 1, n_heads, head_dim)
 
-        # Verify final cache length
-        assert cache.get_context_length(layer_idx=0, seq_id=seq_id) == prompt_len + decode_steps
+        # Verify final context length
+        assert block_manager.get_context_length(seq_id) == prompt_len + decode_steps
+
+        # Cleanup
+        block_manager.free_sequence(seq_id)

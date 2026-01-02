@@ -1,7 +1,7 @@
 """Integration tests for the full inference pipeline."""
 
 import pytest
-from tinygrad import Tensor
+from tinygrad import Tensor, dtypes
 
 from tinyvllm.model.llama import Llama, create_llama
 from tinyvllm.model.weights import LlamaConfig
@@ -148,22 +148,35 @@ class TestEndToEndPipeline:
 
 
 class TestModelWeightLoading:
-    """Test weight loading and model creation."""
+    """Test weight loading and model creation (Phase 4)."""
 
     def test_create_model_without_weights(self):
         """Model should work with random weights."""
         config = small_config()
         model = Llama(config)
-        kv_cache = model.create_kv_cache()
+
+        # Phase 4: Create BlockManager and KVCache
+        from tinyvllm.core.block_manager import BlockManager
+        from tinyvllm.core.kv_cache import KVCache
+
+        block_manager = BlockManager(num_gpus=1, blocks_per_gpu=10, block_size=16)
+        kv_cache = KVCache(
+            num_layers=config.n_layers,
+            num_blocks=10,
+            block_size=16,
+            n_kv_heads=config.n_kv_heads,
+            head_dim=config.head_dim,
+            dtype=dtypes.float32,
+        )
 
         tokens = Tensor([[1, 2, 3, 4]])
-        kv_cache.allocate_sequence(seq_id=0)
-        logits = model(tokens, start_pos=0, kv_cache=kv_cache, seq_id=0)
+        block_manager.allocate_sequence(seq_id=0, num_tokens=4)
+        logits = model(tokens, start_pos=0, kv_cache=kv_cache,
+                       block_manager=block_manager, seq_id=0)
 
         assert logits.shape == (1, 4, config.vocab_size)
-        # Check KV cache has stored tokens for all layers
-        for layer_idx in range(config.n_layers):
-            assert kv_cache.get_context_length(layer_idx, seq_id=0) == 4
+        # Check BlockManager has tracked context length
+        assert block_manager.get_context_length(seq_id=0) == 4
 
     def test_create_model_with_weights(self):
         """Test create_llama with weight dict."""
@@ -198,11 +211,24 @@ class TestModelWeightLoading:
             weights[f"{prefix}post_attention_layernorm.weight"] = Tensor.ones(config.dim)
 
         model = create_llama(config, weights)
-        kv_cache = model.create_kv_cache()
+
+        # Phase 4: Create BlockManager and KVCache
+        from tinyvllm.core.block_manager import BlockManager
+        from tinyvllm.core.kv_cache import KVCache
+
+        block_manager = BlockManager(num_gpus=1, blocks_per_gpu=10, block_size=16)
+        kv_cache = KVCache(
+            num_layers=config.n_layers,
+            num_blocks=10,
+            block_size=16,
+            n_kv_heads=config.n_kv_heads,
+            head_dim=config.head_dim,
+            dtype=dtypes.float32,
+        )
 
         tokens = Tensor([[1, 2, 3]])
-        kv_cache.allocate_sequence(seq_id=0)
-        logits = model(tokens, kv_cache=kv_cache, seq_id=0)
+        block_manager.allocate_sequence(seq_id=0, num_tokens=3)
+        logits = model(tokens, kv_cache=kv_cache, block_manager=block_manager, seq_id=0)
 
         assert logits.shape == (1, 3, config.vocab_size)
 

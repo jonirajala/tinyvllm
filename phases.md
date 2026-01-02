@@ -339,15 +339,13 @@ Two types of request:
 
 ---
 
-### Phase 4: Memory Management & KV Cache Optimization (~200 lines)
+### Phase 4: Block-based KVCache (~200 lines)
 
-Note: BlockManager (block_manager.py) already exists with tests.
-      Currently unused - KVCache manages its own lists.
-      This phase integrates BlockManager for proper memory control.
+Portable tinygrad-native solution. BlockManager already exists with tests.
 
-4.1 KV Cache Optimization (Tinygrad-native)
+4.1 KV Cache with Block Tensors
 - Replace list-based KV cache with pre-allocated block tensors
-- Use separate realized tensors per block (tinygrad compatible)
+- Each block is a separate realized tensor (tinygrad compatible)
 - Tensor.stack() for gathering blocks during attention
 - See docs/phase4_kv_optimization.md for details
 
@@ -357,57 +355,77 @@ Note: BlockManager (block_manager.py) already exists with tests.
 - Scheduler calls block_manager.allocate_sequence() on prefill
 - Scheduler calls block_manager.free_sequence() on finish
 
-4.3 Memory Tracking
-- Track GPU memory usage
+4.3 Batched Forward Pass
+- Process multiple sequences in single forward pass
+- Pad sequences to same length or use attention mask
+- Real throughput improvement from GPU parallelism
+
+4.4 Memory Tracking
 - Track blocks per sequence
 - Memory budget enforcement
-- OOM prevention
-
-4.4 Eviction Policy
-- LRU eviction (least recently used)
-- Preemption (pause low-priority requests)
-- Recomputation (evict, recompute later)
-
-4.5 CPU Swap (Optional)
-- Swap blocks to CPU when GPU full
-- Swap back when needed
-- Async transfers
+- OOM prevention via can_allocate checks
 
 ---
 
-### Phase 5: Optimizations (~300 lines)
+### Phase 5: Custom Kernels (~200 lines)
 
-5.1 Prefill Optimization
+Backend-specific optimized kernels for maximum performance.
+
+5.1 Metal Kernel (Apple Silicon)
+- Fused paged attention (gather + matmul in one kernel)
+- Direct block addressing without copy
+- Use tinygrad's MetalProgram API
+
+5.2 CUDA Kernel (NVIDIA)
+- Fused paged attention for CUDA
+- Optimized memory access patterns
+- Use tinygrad's CUDAProgram API
+
+5.3 Kernel Integration
+- Auto-detect backend and select kernel
+- Fallback to portable Tensor.stack() if no kernel
+- Benchmark: measure speedup vs portable solution
+
+---
+
+### Phase 6: Optimizations (~300 lines)
+
+6.1 Prefill Optimization
 - Chunked prefill (don't block on long prompts)
 - Parallel prefill for batch
 - Flash attention for prefill
 
-5.2 Decode Optimization
+6.2 Decode Optimization
 - CUDA graphs (capture and replay)
 - Fused kernels (RMSNorm + attention)
 - Memory-efficient attention
 
-5.3 Sampling Optimization
+6.3 Sampling Optimization
 - Batched sampling
 - Top-p/top-k on GPU
 - Avoid CPU-GPU sync
 
+6.4 Memory Optimization
+- LRU eviction (least recently used)
+- Preemption (pause low-priority requests)
+- CPU swap (move blocks to CPU when GPU full)
+
 ---
 
-### Phase 6: API Server (~200 lines)
+### Phase 7: API Server (~200 lines)
 
-6.1 HTTP Server
+7.1 HTTP Server
 - FastAPI or simple HTTP server
 - POST /generate endpoint
 - Request validation
 - Async handling
 
-6.2 Streaming
+7.2 Streaming
 - Server-sent events (SSE)
 - Token-by-token streaming
 - Partial response handling
 
-6.3 OpenAI Compatibility (Optional)
+7.3 OpenAI Compatibility (Optional)
 - POST /v1/completions
 - POST /v1/chat/completions
 - Response format matching
@@ -415,21 +433,21 @@ Note: BlockManager (block_manager.py) already exists with tests.
 
 ---
 
-### Phase 7: Advanced Features (Optional, ~400 lines)
+### Phase 8: Advanced Features (Optional, ~400 lines)
 
-7.1 Prefix Caching
+8.1 Prefix Caching
 - Hash prompt prefixes
 - Reuse KV cache for common prefixes
 - Cache eviction policy
 - Cache hit/miss tracking
 
-7.2 Speculative Decoding
+8.2 Speculative Decoding
 - Draft model integration
 - Parallel verification
 - Token acceptance/rejection
 - Speedup measurement
 
-7.3 Multi-Sequence (Beam Search)
+8.3 Multi-Sequence (Beam Search)
 - Fork sequences (share prefix blocks)
 - Track multiple hypotheses
 - Merge/prune beams
@@ -437,19 +455,19 @@ Note: BlockManager (block_manager.py) already exists with tests.
 
 ---
 
-### Phase 8: Multi-GPU Support (Optional, ~200 lines)
+### Phase 9: Multi-GPU Support (Optional, ~200 lines)
 
-8.1 Tensor Parallelism
+9.1 Tensor Parallelism
 - Split model layers across GPUs
 - All-reduce for layer outputs
 - Device placement for weights
 
-8.2 Sequence Parallelism
+9.2 Sequence Parallelism
 - Different sequences on different GPUs
 - KVCache per GPU
 - Load balancing across GPUs
 
-8.3 Pipeline Parallelism
+9.3 Pipeline Parallelism
 - Different layers on different GPUs
 - Micro-batching for pipeline efficiency
 - Async communication between stages
@@ -520,13 +538,19 @@ class GenerateRequest:
 
 ## Milestones & Tests
 
-- Milestone 1: Generate "Hello" → "Hello, world!" (Single request, greedy decoding)
-- Milestone 2: Paged attention matches naive (Output identical with/without paging)
-- Milestone 3: 10 concurrent requests (All complete correctly, no OOM)
-- Milestone 4: Throughput > naive batching (Measure tokens/sec improvement)
-- Milestone 5: Memory efficiency (2x more concurrent requests than naive)
-- Milestone 6: API works (curl POST returns response)
-- Milestone 7: Streaming works (Tokens arrive incrementally)
+| Phase | Milestone | Test |
+|-------|-----------|------|
+| 1 | Basic generation works | Generate "Hello" → coherent output |
+| 2 | Paged attention works | Output identical with/without paging |
+| 3 | Continuous batching works | 10 concurrent requests complete correctly |
+| 4 | Batched forward improves throughput | >2x tokens/sec vs Phase 3 |
+| 4 | BlockManager integration | Memory tracked, OOM prevented |
+| 5 | Custom kernels faster | >1.5x speedup vs Tensor.stack() |
+| 6 | Chunked prefill works | Long prompts don't block other requests |
+| 7 | API works | curl POST /generate returns response |
+| 7 | Streaming works | Tokens arrive incrementally via SSE |
+| 8 | Prefix caching works | Repeated prefixes hit cache |
+| 9 | Multi-GPU works | Model runs across 2+ GPUs |
 
 ---
 

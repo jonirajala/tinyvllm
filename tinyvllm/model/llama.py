@@ -1,13 +1,18 @@
-"""LLaMA model implementation using tinygrad."""
+"""LLaMA model implementation using tinygrad.
 
-from typing import Dict, Optional, Tuple
+Phase 4: Integrates with BlockManager for slot allocation and
+block-based KVCache for storage.
+"""
+
+from typing import Dict, List, Optional, Tuple
 
 from tinygrad import Tensor, dtypes
 from tinygrad.nn import Embedding, Linear
 
 from .weights import LlamaConfig
 from ..core.kv_cache import KVCache
-from ..core.attention_utils import paged_attention_with_kvcache
+from ..core.block_manager import BlockManager
+from ..core.attention_utils import paged_attention_with_blocks, batched_paged_attention
 
 
 class RMSNorm:
@@ -58,7 +63,10 @@ def apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 
 
 class Attention:
-    """Multi-head attention with RoPE and KV cache support."""
+    """Multi-head attention with RoPE and KV cache support.
+
+    Phase 4: Uses BlockManager for slot allocation and block-based KVCache.
+    """
 
     def __init__(self, config: LlamaConfig):
         self.n_heads = config.n_heads
@@ -78,11 +86,15 @@ class Attention:
         cos: Tensor,
         sin: Tensor,
         kv_cache: KVCache,
+        block_manager: BlockManager,
         layer_idx: int,
         seq_id: int,
         start_pos: int = 0,
     ) -> Tensor:
-        """Forward pass with KVCache."""
+        """Forward pass with block-based KVCache.
+
+        Phase 4: Uses BlockManager to get slot for writing K/V.
+        """
         batch, seq_len, _ = x.shape
 
         # Project to Q, K, V
@@ -94,12 +106,138 @@ class Attention:
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
 
-        # Write new K, V to cache, then compute attention
-        kv_cache.write_kv(layer_idx, seq_id, k[0], v[0])
-        out = paged_attention_with_kvcache(q, kv_cache, seq_id, layer_idx, start_pos)
+        # Phase 4: Write K/V to blocks using BlockManager slots
+        # For prefill: write all tokens at once
+        # For decode: write single token
+        self._write_kv_to_blocks(
+            kv_cache, block_manager, layer_idx, seq_id, k[0], v[0], start_pos
+        )
+
+        # Get block table for attention
+        block_table = block_manager.get_block_table(seq_id)
+        # Context length is start_pos + current tokens being processed
+        context_len = start_pos + seq_len
+
+        # Compute attention reading from scattered blocks
+        out = paged_attention_with_blocks(
+            q, kv_cache, block_table, context_len, layer_idx, start_pos
+        )
 
         # Project output
         out = out.reshape(batch, seq_len, -1)
+        return self.wo(out)
+
+    def _write_kv_to_blocks(
+        self,
+        kv_cache: KVCache,
+        block_manager: BlockManager,
+        layer_idx: int,
+        seq_id: int,
+        k: Tensor,
+        v: Tensor,
+        start_pos: int,
+    ) -> None:
+        """Write K/V to block-based cache using BlockManager slots.
+
+        Args:
+            kv_cache: Block-based KV cache
+            block_manager: For slot allocation
+            layer_idx: Which layer
+            seq_id: Sequence ID
+            k: Keys [seq_len, n_kv_heads, head_dim]
+            v: Values [seq_len, n_kv_heads, head_dim]
+            start_pos: Starting position in sequence
+        """
+        seq_len = k.shape[0]
+        block_size = block_manager.block_size
+        block_table = block_manager.get_block_table(seq_id)
+
+        for i in range(seq_len):
+            # Calculate position for this token
+            pos = start_pos + i
+            block_idx = pos // block_size
+            offset = pos % block_size
+
+            # Check if we need a new block (only allocate in first layer)
+            if block_idx >= len(block_table) and layer_idx == 0:
+                # Need to allocate a new block
+                gpu_id = block_manager.get_gpu_for_seq(seq_id)
+                if len(block_manager.free_blocks[gpu_id]) == 0:
+                    raise RuntimeError("Out of KV cache memory!")
+                new_block = block_manager.free_blocks[gpu_id].pop()
+                block_manager.ref_counts[gpu_id][new_block] = 1
+                block_manager.block_tables[seq_id].append(new_block)
+                # Refresh block_table reference
+                block_table = block_manager.get_block_table(seq_id)
+
+            # Get physical block ID from block table
+            block_id = block_table[block_idx]
+
+            # Write single token K/V to the block
+            kv_cache.write_kv(layer_idx, block_id, offset, k[i], v[i])
+
+    def batched_forward(
+        self,
+        x: Tensor,
+        cos: Tensor,
+        sin: Tensor,
+        kv_cache: KVCache,
+        block_manager: BlockManager,
+        layer_idx: int,
+        seq_ids: List[int],
+        start_positions: List[int],
+    ) -> Tensor:
+        """Batched forward for decode (single token per sequence).
+
+        Args:
+            x: [batch, 1, dim] - one token per sequence
+            cos, sin: RoPE embeddings
+            kv_cache: Block-based KV cache
+            block_manager: For slot allocation
+            layer_idx: Which layer
+            seq_ids: List of sequence IDs
+            start_positions: Start position for each sequence
+
+        Returns:
+            output: [batch, 1, dim]
+        """
+        batch, seq_len, _ = x.shape
+        assert seq_len == 1, "Batched forward only for decode (seq_len=1)"
+
+        # Project to Q, K, V - batched
+        q = self.wq(x).reshape(batch, 1, self.n_heads, self.head_dim)
+        k = self.wk(x).reshape(batch, 1, self.n_kv_heads, self.head_dim)
+        v = self.wv(x).reshape(batch, 1, self.n_kv_heads, self.head_dim)
+
+        # Apply RoPE - batched
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
+
+        # Write K/V and compute attention for each sequence
+        queries = []
+        block_tables = []
+        context_lens = []
+
+        for i, (seq_id, start_pos) in enumerate(zip(seq_ids, start_positions)):
+            # Write this sequence's K/V to its blocks
+            self._write_kv_to_blocks(
+                kv_cache, block_manager, layer_idx, seq_id,
+                k[i], v[i], start_pos
+            )
+
+            # Collect info for batched attention
+            queries.append(q[i:i+1])  # Keep batch dim
+            block_tables.append(block_manager.get_block_table(seq_id))
+            context_lens.append(start_pos + 1)
+
+        # Batched attention
+        out = batched_paged_attention(
+            queries, kv_cache, block_tables, context_lens,
+            layer_idx, start_positions
+        )
+
+        # Project output - batched
+        out = out.reshape(batch, 1, -1)
         return self.wo(out)
 
 
@@ -131,6 +269,7 @@ class TransformerBlock:
         cos: Tensor,
         sin: Tensor,
         kv_cache: KVCache,
+        block_manager: BlockManager,
         layer_idx: int,
         seq_id: int,
         start_pos: int = 0,
@@ -138,15 +277,40 @@ class TransformerBlock:
         """Forward pass through transformer block."""
         # Attention with residual
         h = self.attention(
-            self.attention_norm(x), cos, sin, kv_cache, layer_idx, seq_id, start_pos
+            self.attention_norm(x), cos, sin, kv_cache, block_manager,
+            layer_idx, seq_id, start_pos
         )
         x = x + h
         # FFN with residual
         return x + self.feed_forward(self.ffn_norm(x))
 
+    def batched_forward(
+        self,
+        x: Tensor,
+        cos: Tensor,
+        sin: Tensor,
+        kv_cache: KVCache,
+        block_manager: BlockManager,
+        layer_idx: int,
+        seq_ids: List[int],
+        start_positions: List[int],
+    ) -> Tensor:
+        """Batched forward for decode (single token per sequence)."""
+        # Attention with residual - batched
+        h = self.attention.batched_forward(
+            self.attention_norm(x), cos, sin, kv_cache, block_manager,
+            layer_idx, seq_ids, start_positions
+        )
+        x = x + h
+        # FFN with residual - batched (naturally handles batch dim)
+        return x + self.feed_forward(self.ffn_norm(x))
+
 
 class Llama:
-    """LLaMA model."""
+    """LLaMA model.
+
+    Phase 4: Uses BlockManager for slot allocation and block-based KVCache.
+    """
 
     def __init__(self, config: LlamaConfig):
         self.config = config
@@ -171,15 +335,19 @@ class Llama:
         tokens: Tensor,
         start_pos: int = 0,
         kv_cache: KVCache = None,
+        block_manager: BlockManager = None,
         seq_id: int = 0,
     ) -> Tensor:
         """
         Forward pass through the model.
 
+        Phase 4: Uses BlockManager for slot allocation.
+
         Args:
             tokens: Input token IDs [batch, seq_len]
             start_pos: Position in sequence (for generation with cache)
             kv_cache: KVCache instance for paged attention
+            block_manager: BlockManager for slot allocation (Phase 4)
             seq_id: Sequence ID for KVCache
 
         Returns:
@@ -194,21 +362,64 @@ class Llama:
 
         # Forward through layers
         for layer_idx, layer in enumerate(self.layers):
-            h = layer(h, cos, sin, kv_cache, layer_idx, seq_id, start_pos)
+            h = layer(h, cos, sin, kv_cache, block_manager, layer_idx, seq_id, start_pos)
+
+        # Phase 4: After all layers, advance position for each token processed
+        if block_manager is not None:
+            for _ in range(seq_len):
+                block_manager.advance_position(seq_id)
 
         # Output projection
         return self.output(self.norm(h))
 
-    def create_kv_cache(self, dtype=dtypes.float32) -> KVCache:
-        """Create a KVCache sized for this model."""
-        return KVCache(
-            num_layers=self.config.n_layers,
-            num_blocks=100,  # Placeholder, not used in Phase 2
-            block_size=16,   # Placeholder, not used in Phase 2
-            n_kv_heads=self.config.n_kv_heads,
-            head_dim=self.config.head_dim,
-            dtype=dtype,
-        )
+    def batched_decode(
+        self,
+        tokens: Tensor,
+        kv_cache: KVCache,
+        block_manager: BlockManager,
+        seq_ids: List[int],
+        start_positions: List[int],
+    ) -> Tensor:
+        """
+        Batched decode forward pass for multiple sequences.
+
+        Phase 4: Process multiple decode sequences in one forward pass.
+        Each sequence generates one token but we batch the computation.
+
+        Args:
+            tokens: Input token IDs [batch, 1] - one token per sequence
+            kv_cache: KVCache instance for paged attention
+            block_manager: BlockManager for slot allocation
+            seq_ids: List of sequence IDs
+            start_positions: Start position for each sequence
+
+        Returns:
+            logits: Output logits [batch, 1, vocab_size]
+        """
+        batch, seq_len = tokens.shape
+        assert seq_len == 1, "batched_decode only for single token decode"
+
+        h = self.tok_embeddings(tokens)
+
+        # All decode positions use the same relative position (0) for RoPE
+        # But each sequence has a different absolute position
+        # We use start_position for each sequence
+        cos = self.cos[0:1]  # Position 0 relative to current token
+        sin = self.sin[0:1]
+
+        # Forward through layers with batched decode
+        for layer_idx, layer in enumerate(self.layers):
+            h = layer.batched_forward(
+                h, cos, sin, kv_cache, block_manager,
+                layer_idx, seq_ids, start_positions
+            )
+
+        # Advance positions for all sequences
+        for seq_id in seq_ids:
+            block_manager.advance_position(seq_id)
+
+        # Output projection - batched
+        return self.output(self.norm(h))
 
     def load_weights(self, weights: Dict[str, Tensor]):
         """Load pretrained weights into the model."""

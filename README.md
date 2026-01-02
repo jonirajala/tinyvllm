@@ -194,3 +194,92 @@ Note: Efficiency = (actual throughput) / (baseline × n_requests).
 Drops sharply because we process one sequence per step.
 Phase 4 batched forward passes should maintain higher efficiency at scale.
 
+### Phase 4 (Block-based KVCache + Batched Forward)
+
+Config: dim=64, n_layers=4, n_heads=4, max_tokens=20, 5 concurrent requests
+
+**METAL (Apple Silicon)**
+| Benchmark | Tokens/sec | Requests/sec |
+|-----------|------------|--------------|
+| single_request | 4.5 | 0.22 |
+| sequential_5 | 2.4 | 0.12 |
+| concurrent_5 | 6.6 | 0.33 |
+
+Concurrent vs Sequential: **2.82x** speedup
+
+**CPU**
+| Benchmark | Tokens/sec | Requests/sec |
+|-----------|------------|--------------|
+| single_request | 4.3 | 0.22 |
+| sequential_5 | 2.4 | 0.12 |
+| concurrent_5 | 6.0 | 0.30 |
+
+Concurrent vs Sequential: **2.47x** speedup
+
+### Memory Usage (Phase 4)
+
+Run: `python -m benchmarks.bench_memory`
+
+Model: dim=64, layers=4, kv_heads=4, head_dim=16
+Theoretical KV memory per token: 2.0 KB
+
+| Sequences | Tokens | KV Cache Memory | Bytes/Token |
+|-----------|--------|-----------------|-------------|
+| 1 | 18 | 64.0 KB | 3640 |
+| 2 | 36 | 128.0 KB | 3640 |
+| 5 | 90 | 320.0 KB | 3640 |
+| 10 | 144 | 512.0 KB | 3640 |
+
+Note: Block-based allocation has ~1.8x overhead vs theoretical due to
+block granularity (16 tokens/block). Memory is pre-allocated for efficiency.
+
+### Latency (Phase 4)
+
+Run: `python -m benchmarks.bench_latency`
+
+**METAL**
+| Prompt Len | Tokens | TTFT (ms) | TPOT (ms) | E2E (ms) |
+|------------|--------|-----------|-----------|----------|
+| 3 | 10 | 633 | 200 | 2429 |
+| 17 | 10 | 2360 | 148 | 3689 |
+| 51 | 10 | 5746 | 191 | 7462 |
+
+Summary: TTFT=825ms, TPOT=134ms, E2E=2695ms (15 tokens)
+
+**CPU**
+| Prompt Len | Tokens | TTFT (ms) | TPOT (ms) | E2E (ms) |
+|------------|--------|-----------|-----------|----------|
+| 3 | 10 | 859 | 230 | 2927 |
+| 17 | 10 | 4085 | 166 | 5578 |
+| 51 | 10 | 11780 | 319 | 14651 |
+
+Summary: TTFT=835ms, TPOT=150ms, E2E=2931ms (15 tokens)
+
+### Scalability (Phase 4)
+
+Run: `python -m benchmarks.bench_scalability`
+
+**METAL - Throughput vs Concurrent Requests**
+| Requests | Tok/sec | Efficiency |
+|----------|---------|------------|
+| 1 | 4.0 | 100% |
+| 2 | 5.1 | 63% |
+| 4 | 5.9 | 37% |
+| 8 | 5.8 | 18% |
+| 16 | 6.0 | 9% |
+
+**CPU - Throughput vs Concurrent Requests**
+| Requests | Tok/sec | Efficiency |
+|----------|---------|------------|
+| 1 | 3.3 | 100% |
+| 2 | 4.9 | 73% |
+| 4 | 5.5 | 41% |
+| 8 | 4.7 | 18% |
+| 16 | 5.1 | 10% |
+
+Phase 4 improvements:
+- Block-based KVCache with pre-allocated tensors
+- BlockManager for memory slot allocation
+- Batched decode forward pass (multiple sequences in one call)
+- Result: **>2x throughput improvement** over sequential processing
+

@@ -3,8 +3,12 @@
 The engine ties everything together:
 - Model (LLaMA)
 - KVCache (paged attention storage)
+- BlockManager (memory allocation)
 - Scheduler (batch composition)
 - Tokenizer (encode/decode)
+
+Phase 4: Integrates BlockManager for memory-aware scheduling and
+block-based KV cache storage.
 
 It runs the main generation loop:
     while has_requests:
@@ -36,11 +40,13 @@ Or step-by-step:
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Optional
 
-from tinygrad import Tensor
+from tinygrad import Tensor, dtypes
 
 from ..model.llama import Llama
 from ..core.scheduler import Scheduler
 from ..core.sequence import Request, Sequence
+from ..core.block_manager import BlockManager
+from ..core.kv_cache import KVCache
 from ..engine.sampling import SamplingParams, sample_token
 
 
@@ -94,7 +100,8 @@ class LLMEngine:
         model: Llama,
         tokenizer,
         max_batch_size: int = 8,
-        max_seq_len: int = 2048,
+        num_blocks: int = 100,
+        block_size: int = 16,
     ):
         """
         Initialize the engine.
@@ -103,14 +110,33 @@ class LLMEngine:
             model: LLaMA model instance
             tokenizer: Tokenizer with encode/decode methods
             max_batch_size: Maximum sequences per batch
-            max_seq_len: Maximum sequence length
+            num_blocks: Number of KV cache blocks (Phase 4)
+            block_size: Tokens per block (Phase 4)
         """
         self.model = model
         self.tokenizer = tokenizer
         self.max_batch_size = max_batch_size
-        self.max_seq_len = max_seq_len
-        self.scheduler = Scheduler(max_batch_size)
-        self.kv_cache = model.create_kv_cache()
+        self.block_size = block_size
+
+        # Phase 4: Create BlockManager for memory allocation
+        self.block_manager = BlockManager(
+            num_gpus=1,
+            blocks_per_gpu=num_blocks,
+            block_size=block_size,
+        )
+
+        # Phase 4: Create block-based KVCache
+        self.kv_cache = KVCache(
+            num_layers=model.config.n_layers,
+            num_blocks=num_blocks,
+            block_size=block_size,
+            n_kv_heads=model.config.n_kv_heads,
+            head_dim=model.config.head_dim,
+            dtype=dtypes.float32,
+        )
+
+        # Phase 4: Scheduler with BlockManager integration
+        self.scheduler = Scheduler(max_batch_size, block_manager=self.block_manager)
         self.next_request_id = 0
 
         # Mappings
@@ -159,11 +185,13 @@ class LLMEngine:
 
         This is the core engine loop iteration:
         1. Get batch from scheduler
-        2. Prepare inputs (handle prefill vs decode)
-        3. Run model forward
+        2. Separate prefill vs decode sequences
+        3. Process prefill one-by-one, decode in batch
         4. Sample next tokens
         5. Update scheduler
         6. Return any finished outputs
+
+        Phase 4: Uses BlockManager for slot allocation and batched decode.
 
         Returns:
             List of GenerationOutput for requests that finished this step
@@ -176,36 +204,35 @@ class LLMEngine:
         seq_outputs = {}      # seq_id -> new token
         finished_seqs = []    # seq_ids that finished
 
+        # Separate prefill and decode sequences
+        prefill_seqs = []
+        decode_seqs = []
+
         for seq in batch.scheduled_seqs:
-            request = self.requests[seq.request_id]
-
-            # Determine if prefill or decode
             if seq.get_output_len() == 0:
-                # PREFILL: first time, process full prompt
-                self.kv_cache.allocate_sequence(seq.seq_id)
-                input_ids = Tensor([seq.prompt_tokens])  # [1, prompt_len]
-                start_pos = 0
+                prefill_seqs.append(seq)
             else:
-                # DECODE: continuing, process just last token
-                last_token = seq.output_tokens[-1]
-                input_ids = Tensor([[last_token]])  # [1, 1]
-                start_pos = seq.get_len() - 1
+                decode_seqs.append(seq)
 
-            # Run model
-            logits = self.model(input_ids, start_pos=start_pos,
-                               kv_cache=self.kv_cache, seq_id=seq.seq_id)
-
-            # Sample next token
+        # Process prefill sequences one-by-one (different lengths)
+        for seq in prefill_seqs:
+            request = self.requests[seq.request_id]
+            input_ids = Tensor([seq.prompt_tokens])
+            logits = self.model(
+                input_ids,
+                start_pos=0,
+                kv_cache=self.kv_cache,
+                block_manager=self.block_manager,
+                seq_id=seq.seq_id
+            )
             next_token = sample_token(
                 logits[0, -1, :],
                 request.sampling_params,
                 seq.get_all_tokens()
             )
-
             seq_outputs[seq.seq_id] = next_token
 
-            # Check if finished
-            finish_reason = self._check_finished(seq.seq_id, next_token, seq, request)
+            finish_reason = self._check_finished(next_token, seq, request)
             if finish_reason:
                 finished_seqs.append(seq.seq_id)
                 finished_outputs.append(GenerationOutput(
@@ -214,9 +241,50 @@ class LLMEngine:
                     tokens=seq.output_tokens + [next_token],
                     finish_reason=finish_reason
                 ))
-                self.kv_cache.free_sequence(seq.seq_id)
 
-        # Update scheduler with results
+        # Process decode sequences in batch (all have 1 token)
+        if decode_seqs:
+            tokens_list = []
+            seq_ids = []
+            start_positions = []
+
+            for seq in decode_seqs:
+                last_token = seq.output_tokens[-1]
+                tokens_list.append(last_token)
+                seq_ids.append(seq.seq_id)
+                start_positions.append(seq.get_len() - 1)
+
+            # Batched forward pass
+            input_ids = Tensor(tokens_list).reshape(len(decode_seqs), 1)
+            logits = self.model.batched_decode(
+                input_ids,
+                kv_cache=self.kv_cache,
+                block_manager=self.block_manager,
+                seq_ids=seq_ids,
+                start_positions=start_positions
+            )
+
+            # Sample tokens for each sequence
+            for i, seq in enumerate(decode_seqs):
+                request = self.requests[seq.request_id]
+                next_token = sample_token(
+                    logits[i, 0, :],
+                    request.sampling_params,
+                    seq.get_all_tokens()
+                )
+                seq_outputs[seq.seq_id] = next_token
+
+                finish_reason = self._check_finished(next_token, seq, request)
+                if finish_reason:
+                    finished_seqs.append(seq.seq_id)
+                    finished_outputs.append(GenerationOutput(
+                        request_id=request.request_id,
+                        text=self.tokenizer.decode(seq.output_tokens + [next_token]),
+                        tokens=seq.output_tokens + [next_token],
+                        finish_reason=finish_reason
+                    ))
+
+        # Update scheduler with results (also frees blocks for finished seqs)
         self.scheduler.update(seq_outputs, finished_seqs)
 
         return finished_outputs
@@ -255,7 +323,6 @@ class LLMEngine:
 
     def _check_finished(
         self,
-        seq_id: int,
         token: int,
         sequence: Sequence,
         request: Request,
@@ -264,7 +331,6 @@ class LLMEngine:
         Check if sequence should finish.
 
         Args:
-            seq_id: Sequence ID
             token: Just-generated token
             sequence: The sequence
             request: The request
