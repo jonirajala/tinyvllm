@@ -1,0 +1,4 @@
+tinygrad
+safetensors
+tiktoken
+sentencepiece
