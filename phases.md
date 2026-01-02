@@ -270,3 +270,275 @@ Two types of request:
     - Only the newest generated token is forward passed
     - Memory-bandwidth-bound
 
+---
+
+## Full Implementation Roadmap
+
+### Phase 1: Foundation (~400 lines)
+
+1.1 Basic Inference Loop
+- Token generation loop (greedy)
+- KV cache (naive, pre-allocated)
+- Sampling (temperature, top-p, top-k)
+- Stop conditions (EOS, max length)
+
+1.2 Model Loading
+- Load LLaMA weights (safetensors)
+- LLaMA architecture (attention, FFN, RMSNorm)
+- RoPE positional embeddings
+- Tokenizer (use tiktoken or sentencepiece)
+
+1.3 Basic API
+- Simple Python interface
+- generate(prompt) → string
+- generate_stream(prompt) → iterator
+
+---
+
+### Phase 2: Paged Attention (~400 lines)
+
+2.1 Block Manager
+- Block allocator (malloc/free for KV blocks)
+- Free list management
+- Block reference counting
+- Sequence → block table mapping
+
+2.2 Paged KV Cache
+- Physical block storage (GPU tensor)
+- Logical → physical mapping
+- Allocate on demand (as tokens generated)
+- Free blocks when sequence done
+
+2.3 Paged Attention Kernel
+- Gather K,V from scattered blocks
+- Compute attention with block tables
+- Handle variable sequence lengths
+- (Optional) CUDA kernel for speed
+
+---
+
+### Phase 3: Continuous Batching (~300 lines)
+
+3.1 Request Queue
+- Add request (prompt + params)
+- Request states (waiting, running, finished)
+- Request metadata (arrival time, tokens generated)
+- Callbacks for completion
+
+3.2 Scheduler
+- Select requests for next batch
+- Dynamic batch composition
+- Add new requests when slots free
+- Remove finished requests immediately
+
+3.3 Batch Execution
+- Prepare batched inputs
+- Handle mixed prefill + decode
+- Update KV cache per sequence
+- Dispatch results to requests
+
+---
+
+### Phase 4: Memory Management & KV Cache Optimization (~200 lines)
+
+Note: BlockManager (block_manager.py) already exists with tests.
+      Currently unused - KVCache manages its own lists.
+      This phase integrates BlockManager for proper memory control.
+
+4.1 KV Cache Optimization (Tinygrad-native)
+- Replace list-based KV cache with pre-allocated block tensors
+- Use separate realized tensors per block (tinygrad compatible)
+- Tensor.stack() for gathering blocks during attention
+- See docs/phase4_kv_optimization.md for details
+
+4.2 Integrate BlockManager
+- Connect BlockManager to Scheduler (can_allocate checks)
+- Connect BlockManager to KVCache (block-based storage)
+- Scheduler calls block_manager.allocate_sequence() on prefill
+- Scheduler calls block_manager.free_sequence() on finish
+
+4.3 Memory Tracking
+- Track GPU memory usage
+- Track blocks per sequence
+- Memory budget enforcement
+- OOM prevention
+
+4.4 Eviction Policy
+- LRU eviction (least recently used)
+- Preemption (pause low-priority requests)
+- Recomputation (evict, recompute later)
+
+4.5 CPU Swap (Optional)
+- Swap blocks to CPU when GPU full
+- Swap back when needed
+- Async transfers
+
+---
+
+### Phase 5: Optimizations (~300 lines)
+
+5.1 Prefill Optimization
+- Chunked prefill (don't block on long prompts)
+- Parallel prefill for batch
+- Flash attention for prefill
+
+5.2 Decode Optimization
+- CUDA graphs (capture and replay)
+- Fused kernels (RMSNorm + attention)
+- Memory-efficient attention
+
+5.3 Sampling Optimization
+- Batched sampling
+- Top-p/top-k on GPU
+- Avoid CPU-GPU sync
+
+---
+
+### Phase 6: API Server (~200 lines)
+
+6.1 HTTP Server
+- FastAPI or simple HTTP server
+- POST /generate endpoint
+- Request validation
+- Async handling
+
+6.2 Streaming
+- Server-sent events (SSE)
+- Token-by-token streaming
+- Partial response handling
+
+6.3 OpenAI Compatibility (Optional)
+- POST /v1/completions
+- POST /v1/chat/completions
+- Response format matching
+- Usage statistics
+
+---
+
+### Phase 7: Advanced Features (Optional, ~400 lines)
+
+7.1 Prefix Caching
+- Hash prompt prefixes
+- Reuse KV cache for common prefixes
+- Cache eviction policy
+- Cache hit/miss tracking
+
+7.2 Speculative Decoding
+- Draft model integration
+- Parallel verification
+- Token acceptance/rejection
+- Speedup measurement
+
+7.3 Multi-Sequence (Beam Search)
+- Fork sequences (share prefix blocks)
+- Track multiple hypotheses
+- Merge/prune beams
+- Copy-on-write for blocks
+
+---
+
+### Phase 8: Multi-GPU Support (Optional, ~200 lines)
+
+8.1 Tensor Parallelism
+- Split model layers across GPUs
+- All-reduce for layer outputs
+- Device placement for weights
+
+8.2 Sequence Parallelism
+- Different sequences on different GPUs
+- KVCache per GPU
+- Load balancing across GPUs
+
+8.3 Pipeline Parallelism
+- Different layers on different GPUs
+- Micro-batching for pipeline efficiency
+- Async communication between stages
+
+---
+
+## File Structure
+
+```
+tinyvllm/
+├── __init__.py
+├── model/
+│   ├── llama.py           # LLaMA architecture
+│   ├── attention.py       # Paged attention
+│   └── sampling.py        # Token sampling
+├── core/
+│   ├── block_manager.py   # Block allocation
+│   ├── kv_cache.py        # Paged KV cache
+│   ├── scheduler.py       # Continuous batching
+│   └── sequence.py        # Request/sequence state
+├── engine/
+│   ├── engine.py          # Main engine loop
+│   └── async_engine.py    # Async wrapper
+├── api/
+│   ├── server.py          # HTTP server
+│   └── openai.py          # OpenAI compat
+└── utils/
+    ├── memory.py          # Memory tracking
+    └── tokenizer.py       # Tokenizer wrapper
+```
+
+---
+
+## Key Data Structures
+
+```python
+@dataclass
+class Block:
+    block_id: int
+    ref_count: int = 0
+
+@dataclass
+class Sequence:
+    seq_id: int
+    prompt_tokens: list[int]
+    output_tokens: list[int]
+    block_table: list[int]      # Logical → physical block mapping
+    status: Literal["waiting", "running", "finished"]
+
+@dataclass
+class SchedulerOutput:
+    scheduled_seqs: list[Sequence]
+    blocks_to_swap_in: dict[int, int]   # CPU → GPU
+    blocks_to_swap_out: dict[int, int]  # GPU → CPU
+    blocks_to_copy: dict[int, int]      # For beam search
+
+@dataclass
+class GenerateRequest:
+    prompt: str
+    max_tokens: int = 256
+    temperature: float = 1.0
+    top_p: float = 1.0
+    stop: list[str] = None
+    stream: bool = False
+```
+
+---
+
+## Milestones & Tests
+
+- Milestone 1: Generate "Hello" → "Hello, world!" (Single request, greedy decoding)
+- Milestone 2: Paged attention matches naive (Output identical with/without paging)
+- Milestone 3: 10 concurrent requests (All complete correctly, no OOM)
+- Milestone 4: Throughput > naive batching (Measure tokens/sec improvement)
+- Milestone 5: Memory efficiency (2x more concurrent requests than naive)
+- Milestone 6: API works (curl POST returns response)
+- Milestone 7: Streaming works (Tokens arrive incrementally)
+
+---
+
+## Dependencies (Minimal)
+
+Required:
+- tinygrad
+- safetensors (weight loading)
+- tiktoken (tokenizer, or sentencepiece)
+
+Optional:
+- fastapi (API server)
+- uvicorn (ASGI server)
+- triton (custom kernels)
+
