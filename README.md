@@ -372,3 +372,59 @@ Phase 5 improvements:
 - Flat tensor storage in KVCache for efficient kernel access
 - Backend dispatcher for Metal/CPU selection
 
+### Real Model: TinyLlama 1.1B
+
+Run with: `DEVICE=METAL GPU=M4_10CORE python -m benchmarks.bench_throughput --model models/tinyllama`
+
+**Hardware:** Apple M4 10-core GPU (120 GB/s memory bandwidth)
+
+**Model:** TinyLlama 1.1B (2048 dim, 22 layers, FP16 weights = 2.2 GB)
+
+**Theoretical Maximum (Memory-Bound):** 55 tok/s
+
+#### Throughput
+
+| Benchmark | Tokens/sec | Utilization | Headroom |
+|-----------|------------|-------------|----------|
+| single_request | 1.4 | 2.6% | 97% |
+| sequential_5 | 1.3 | 2.5% | 98% |
+| concurrent_5 | 3.1 | 5.6% | 94% |
+
+Concurrent vs Sequential: **2.26x** speedup
+
+#### Latency
+
+| Metric | Value |
+|--------|-------|
+| TTFT (Time to First Token) | 942 ms |
+| TPOT (Time Per Output Token) | 722 ms |
+| Decode throughput | 1.4 tok/s |
+
+#### Memory
+
+| Context Length | KV Cache per Sequence |
+|----------------|----------------------|
+| 512 | 11.0 MB |
+| 1024 | 22.0 MB |
+| 2048 | 44.0 MB |
+| 4096 | 88.0 MB |
+
+#### Scalability
+
+| Requests | Tok/sec | Efficiency |
+|----------|---------|------------|
+| 1 | 1.2 | 100% |
+| 2 | 1.8 | 74% |
+| 4 | 2.5 | 50% |
+
+#### Analysis
+
+Current utilization is ~5% of theoretical maximum (55 tok/s memory-bound limit).
+The 18x gap is due to:
+- Single-thread Metal kernel (using 1.25% of GPU threads)
+- SIMD inefficiency (1/32 lanes active = 3% efficiency)
+- Scalar memory loads (75% bandwidth waste)
+- Two-pass softmax (2x KV cache reads)
+
+See [docs/metal_optimizations.md](docs/metal_optimizations.md) for Phase 6 optimization roadmap targeting 10-30x speedup.
+

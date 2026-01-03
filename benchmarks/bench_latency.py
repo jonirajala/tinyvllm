@@ -1,22 +1,29 @@
 """Benchmark: Measure latency metrics (TTFT, TPOT, E2E).
 
-Run with: python -m benchmarks.bench_latency
+Run with:
+  python -m benchmarks.bench_latency                    # tiny test model
+  python -m benchmarks.bench_latency --model models/tinyllama  # real model
+  DEVICE=METAL GPU=M4_10CORE python -m benchmarks.bench_latency --model models/tinyllama
 """
 
 import os
 import time
+import argparse
+from pathlib import Path
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 from tinygrad import Tensor, Device
 
 if "DEVICE" in os.environ:
     Device.DEFAULT = os.environ["DEVICE"]
 
-from tinyvllm.model.llama import Llama
-from tinyvllm.model.weights import LlamaConfig
+from tinyvllm.model.llama import Llama, create_llama
+from tinyvllm.model.weights import LlamaConfig, load_llama_weights
+from tinyvllm.model.tokenizer import load_tokenizer
 from tinyvllm.engine.sampling import SamplingParams
 from tinyvllm.engine.engine import LLMEngine
+from benchmarks.gpu_specs import get_gpu_specs, TheoreticalLimits
 
 
 @dataclass
@@ -25,6 +32,8 @@ class LatencyResult:
     tpot_ms: float  # Time per output token (average)
     e2e_ms: float   # End-to-end latency
     num_tokens: int
+    decode_tok_per_sec: Optional[float] = None  # Decode throughput
+    utilization_pct: Optional[float] = None     # vs theoretical max
 
 
 class MockTokenizer:
@@ -42,38 +51,6 @@ class MockTokenizer:
 
     def decode(self, tokens):
         return "".join(chr((t % 26) + ord("a")) for t in tokens if t > 2)
-
-
-def measure_latency(model, tokenizer, prompt: str, max_tokens: int) -> LatencyResult:
-    """Measure latency for a single request."""
-    params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
-    engine = LLMEngine(model, tokenizer)
-    engine.add_request(prompt, params)
-
-    token_times = []
-    start = time.perf_counter()
-
-    while engine.has_unfinished():
-        step_start = time.perf_counter()
-        outputs = engine.step()
-        step_end = time.perf_counter()
-        token_times.append(step_end - step_start)
-
-        if outputs:
-            break
-
-    end = time.perf_counter()
-
-    ttft = token_times[0] * 1000 if token_times else 0
-    tpot = (sum(token_times[1:]) / len(token_times[1:]) * 1000) if len(token_times) > 1 else 0
-    e2e = (end - start) * 1000
-
-    return LatencyResult(
-        ttft_ms=ttft,
-        tpot_ms=tpot,
-        e2e_ms=e2e,
-        num_tokens=len(token_times)
-    )
 
 
 def measure_latency_detailed(model, tokenizer, prompt: str, max_tokens: int) -> LatencyResult:
@@ -116,54 +93,109 @@ def measure_latency_detailed(model, tokenizer, prompt: str, max_tokens: int) -> 
     )
 
 
-def run_latency_benchmark():
+def run_latency_benchmark(model_path: Optional[str] = None):
     print("=" * 50)
     print("tinyvllm Latency Benchmark")
     print("=" * 50)
     print(f"Device: {Device.DEFAULT}")
 
-    config = LlamaConfig(
-        dim=64, n_layers=4, n_heads=4, n_kv_heads=4,
-        vocab_size=256, hidden_dim=256, max_seq_len=512
+    # Get GPU specs for theoretical limits
+    gpu_name = os.environ.get("GPU", "M4_10CORE")
+    gpu = get_gpu_specs(gpu_name)
+    print(f"GPU specs: {gpu.name}")
+
+    # Create or load model
+    if model_path:
+        print(f"\nLoading model from {model_path}...")
+        config, weights = load_llama_weights(Path(model_path))
+        model = create_llama(config, weights)
+        tokenizer = load_tokenizer(model_path)
+        total_params = sum(w.numel() for w in weights.values())
+        sample_weight = next(iter(weights.values()))
+        bytes_per_param = sample_weight.dtype.itemsize
+        print(f"Model: {config.dim} dim, {config.n_layers} layers, {total_params/1e9:.2f}B params")
+    else:
+        print("\nCreating tiny test model...")
+        config = LlamaConfig(
+            dim=64, n_layers=4, n_heads=4, n_kv_heads=4,
+            vocab_size=256, hidden_dim=256, max_seq_len=512
+        )
+        model = Llama(config)
+        tokenizer = MockTokenizer(vocab_size=config.vocab_size)
+        total_params = 0
+        bytes_per_param = 4.0
+
+    # Calculate theoretical limits
+    avg_context_len = 50 if model_path else 15
+    theoretical = TheoreticalLimits(
+        n_heads=config.n_heads,
+        n_kv_heads=config.n_kv_heads,
+        head_dim=config.head_dim,
+        context_len=avg_context_len,
+        batch_size=1,
+        gpu=gpu,
+        n_layers=config.n_layers,
+        dim=config.dim,
+        vocab_size=config.vocab_size,
+        total_params=total_params,
+        bytes_per_param=bytes_per_param,
     )
-    model = Llama(config)
-    tokenizer = MockTokenizer(vocab_size=config.vocab_size)
 
-    print(f"Model: dim={config.dim}, layers={config.n_layers}")
+    print("\n" + "=" * 50)
+    print("Theoretical Limits")
+    print("=" * 50)
+    print(f"Full model max: {theoretical.max_tokens_per_sec_full_model:,.0f} tok/s ({theoretical.full_model_bottleneck}-bound)")
+    print(f"Min TPOT: {1000 / theoretical.max_tokens_per_sec_full_model:.1f} ms")
 
-    # Warmup - run multiple times to ensure JIT is warmed
-    print("\nWarming up (3 runs)...")
-    for _ in range(3):
+    # Warmup
+    print("\n" + "=" * 50)
+    print("Benchmarks")
+    print("=" * 50)
+    print("\nWarming up (2 runs)...")
+    for _ in range(2):
         engine = LLMEngine(model, tokenizer)
-        engine.add_request("warmup prompt here", SamplingParams(max_tokens=10, temperature=0.0))
+        engine.add_request("warmup", SamplingParams(max_tokens=5, temperature=0.0))
         list(engine.run())
 
     # Single request latency
     print("\n### Single Request Latency ###")
-    print("| Prompt Len | Tokens | TTFT (ms) | TPOT (ms) | E2E (ms) |")
-    print("|------------|--------|-----------|-----------|----------|")
+    print("| Prompt | Tokens | TTFT (ms) | TPOT (ms) | tok/s | Util % |")
+    print("|--------|--------|-----------|-----------|-------|--------|")
 
-    for prompt, max_tok in [("Hi", 10), ("Hello world test", 10), ("A" * 50, 10)]:
+    prompts = [("Hi", 10), ("Hello world", 10), ("A" * 20, 10)] if not model_path else [
+        ("Hello", 10), ("How are you today?", 10), ("Tell me a story", 10)
+    ]
+
+    for prompt, max_tok in prompts:
         result = measure_latency_detailed(model, tokenizer, prompt, max_tok)
-        prompt_len = len(tokenizer.encode(prompt))
-        print(f"| {prompt_len:10} | {result.num_tokens:6} | {result.ttft_ms:9.1f} | {result.tpot_ms:9.1f} | {result.e2e_ms:8.1f} |")
-
-    # Latency vs output length
-    print("\n### Latency vs Output Length ###")
-    print("| Max Tokens | Actual | TTFT (ms) | TPOT (ms) | E2E (ms) |")
-    print("|------------|--------|-----------|-----------|----------|")
-
-    for max_tok in [5, 10, 20]:
-        result = measure_latency_detailed(model, tokenizer, "Test prompt", max_tok)
-        print(f"| {max_tok:10} | {result.num_tokens:6} | {result.ttft_ms:9.1f} | {result.tpot_ms:9.1f} | {result.e2e_ms:8.1f} |")
+        decode_tps = 1000 / result.tpot_ms if result.tpot_ms > 0 else 0
+        util = theoretical.utilization_full_model(decode_tps)
+        print(f"| {prompt[:8]:8} | {result.num_tokens:6} | {result.ttft_ms:9.0f} | {result.tpot_ms:9.0f} | {decode_tps:5.1f} | {util:5.1f}% |")
 
     # Summary
     print("\n### Summary ###")
     result = measure_latency_detailed(model, tokenizer, "Hello world", 15)
-    print(f"TTFT (Time to First Token): {result.ttft_ms:.1f} ms")
-    print(f"TPOT (Time Per Output Token): {result.tpot_ms:.1f} ms")
-    print(f"E2E (End-to-End): {result.e2e_ms:.1f} ms for {result.num_tokens} tokens")
+    decode_tps = 1000 / result.tpot_ms if result.tpot_ms > 0 else 0
+    util = theoretical.utilization_full_model(decode_tps)
+
+    print(f"TTFT (Time to First Token): {result.ttft_ms:.0f} ms")
+    print(f"TPOT (Time Per Output Token): {result.tpot_ms:.0f} ms")
+    print(f"Decode throughput: {decode_tps:.1f} tok/s")
+    print(f"E2E: {result.e2e_ms:.0f} ms for {result.num_tokens} tokens")
+
+    print("\n### vs Theoretical Max ###")
+    print(f"Theoretical max: {theoretical.max_tokens_per_sec_full_model:,.0f} tok/s")
+    print(f"Achieved: {decode_tps:.1f} tok/s")
+    print(f"Utilization: {util:.1f}%")
+    if decode_tps > 0:
+        print(f"Potential speedup: {theoretical.max_tokens_per_sec_full_model / decode_tps:.1f}x")
+
+    if config.dim < 512:
+        print("\nNOTE: Small test model - use --model models/tinyllama for realistic benchmarks.")
 
 
 if __name__ == "__main__":
-    run_latency_benchmark()
+    parser = argparse.ArgumentParser(description="Latency benchmark")
+    parser.add_argument("--model", type=str, help="Path to model directory")
+    args = parser.parse_args()
+    run_latency_benchmark(model_path=args.model)

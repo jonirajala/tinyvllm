@@ -385,41 +385,55 @@ Metal kernel for Apple Silicon. CUDA kernel deferred to Phase 6.
 
 ### Phase 6: Optimizations (~300 lines)
 
-6.1 Prefill Optimization
+6.1 Sampling Optimization (QUICK WINS)
+- Remove .realize().tolist() sync points  ← easy, high impact
+- Batched sampling across sequences (currently single token at a time)
+- Top-p/top-k on GPU (currently converts to CPU list)
+
+6.2 Metal Kernel Optimizations (INCREMENTAL)
+See docs/metal_optimizations.md for detailed research.
+
+Quick wins:
+- Pre-allocate output buffer once (reuse instead of Tensor.zeros() each call)
+- Cache Metal buffer references (avoid uop tree traversal every call)
+- Reuse block table tensor (overwrite values instead of new Tensor each call)
+- Reuse context_lens tensor (pre-allocate [max_batch] tensor)
+- half precision (float16 instead of float32 - 2x register efficiency)
+
+Medium effort:
+- 32-thread threadgroups (one simdgroup, avoid threadgroup barriers)
+- SIMD shuffle reductions (simd_sum instead of shared memory)
+- Vectorized float4 loads (16-byte aligned memory access)
+- Loop unrolling (unroll head_dim loops for instruction-level parallelism)
+- Command buffer batching (multiple ops per submit)
+
+High effort:
+- Online softmax (single pass instead of two-pass)
+- Tiled attention (Flash Attention style blocking)
+- simdgroup_async_copy (overlap compute and memory loads, M1+)
+- Buffer pooling (reusable GPU memory pools)
+
+6.3 Decode Optimization
+- KV cache write batching (batch realizes instead of per-token)
+- Fused kernels (RMSNorm + Linear, RoPE + Projection)
+- Memory-efficient attention
+
+6.4 Prefill Optimization (COMPLEX)
 - Chunked prefill (don't block on long prompts)
 - Batched prefill (process multiple prefill sequences together, currently one-by-one)
 - Flash attention for prefill
 
-6.2 Decode Optimization
-- CUDA graphs (capture and replay)
-- Fused kernels (RMSNorm + Linear, RoPE + Projection)
-- Memory-efficient attention
-- KV cache write batching (batch realizes instead of per-token)
-
-6.3 Sampling Optimization
-- Batched sampling across sequences (currently single token at a time)
-- Top-p/top-k on GPU (currently converts to CPU list)
-- Remove .realize().tolist() sync points in sampling.py (lines 26, 44, 62, 79, 120)
-
-6.4 Memory Optimization
+6.5 Memory Optimization (ADVANCED)
 - LRU eviction (least recently used)
 - Memory defragmentation/compaction (prevent external fragmentation)
 - CPU swap (move blocks to CPU when GPU full)
 - Attention mask caching (reuse masks for common patterns)
 
-6.5 Metal Kernel Optimizations
-- Pre-allocate output buffer once (reuse instead of Tensor.zeros() each call)
-- Cache Metal buffer references (avoid uop tree traversal every call)
-- Reuse block table tensor (overwrite values instead of new Tensor each call)
-- Reuse context_lens tensor (pre-allocate [max_batch] tensor)
-- Larger threadgroups with shared memory (32+ threads per head cooperating)
-- Vectorized loads (float4 instead of scalar float reads)
-- Loop unrolling (unroll head_dim loops for instruction-level parallelism)
-
-6.6 CUDA Kernel (NVIDIA)
+6.6 CUDA Kernel (LAST)
 - Fused paged attention for CUDA
 - Optimized memory access patterns
 - Use tinygrad's CUDAProgram API
+- CUDA graphs (capture and replay decode loop)
 
 ---
 

@@ -1,21 +1,29 @@
 """Benchmark: Measure scalability (throughput vs batch size, max concurrent).
 
-Run with: python -m benchmarks.bench_scalability
+Run with:
+  python -m benchmarks.bench_scalability                    # tiny test model
+  python -m benchmarks.bench_scalability --model models/tinyllama  # real model
+  DEVICE=METAL GPU=M4_10CORE python -m benchmarks.bench_scalability --model models/tinyllama
 """
 
 import os
 import time
+import argparse
+from pathlib import Path
 from dataclasses import dataclass
+from typing import Optional
 
 from tinygrad import Tensor, Device
 
 if "DEVICE" in os.environ:
     Device.DEFAULT = os.environ["DEVICE"]
 
-from tinyvllm.model.llama import Llama
-from tinyvllm.model.weights import LlamaConfig
+from tinyvllm.model.llama import Llama, create_llama
+from tinyvllm.model.weights import LlamaConfig, load_llama_weights
+from tinyvllm.model.tokenizer import load_tokenizer
 from tinyvllm.engine.sampling import SamplingParams
 from tinyvllm.engine.engine import LLMEngine
+from benchmarks.gpu_specs import get_gpu_specs, TheoreticalLimits
 
 
 class MockTokenizer:
@@ -77,22 +85,65 @@ def measure_throughput_avg(model, tokenizer, n_requests: int, max_tokens: int, r
     }
 
 
-def run_scalability_benchmark():
+def run_scalability_benchmark(model_path: Optional[str] = None):
     print("=" * 50)
     print("tinyvllm Scalability Benchmark")
     print("=" * 50)
     print(f"Device: {Device.DEFAULT}")
 
-    config = LlamaConfig(
-        dim=64, n_layers=4, n_heads=4, n_kv_heads=4,
-        vocab_size=256, hidden_dim=256, max_seq_len=512
-    )
-    model = Llama(config)
-    tokenizer = MockTokenizer(vocab_size=config.vocab_size)
+    # Get GPU specs for theoretical limits
+    gpu_name = os.environ.get("GPU", "M4_10CORE")
+    gpu = get_gpu_specs(gpu_name)
+    print(f"GPU specs: {gpu.name}")
 
-    print(f"Model: dim={config.dim}, layers={config.n_layers}")
+    # Create or load model
+    if model_path:
+        print(f"\nLoading model from {model_path}...")
+        config, weights = load_llama_weights(Path(model_path))
+        model = create_llama(config, weights)
+        tokenizer = load_tokenizer(model_path)
+        total_params = sum(w.numel() for w in weights.values())
+        sample_weight = next(iter(weights.values()))
+        bytes_per_param = sample_weight.dtype.itemsize
+        print(f"Model: {config.dim} dim, {config.n_layers} layers, {total_params/1e9:.2f}B params")
+    else:
+        print("\nCreating tiny test model...")
+        config = LlamaConfig(
+            dim=64, n_layers=4, n_heads=4, n_kv_heads=4,
+            vocab_size=256, hidden_dim=256, max_seq_len=512
+        )
+        model = Llama(config)
+        tokenizer = MockTokenizer(vocab_size=config.vocab_size)
+        total_params = 0
+        bytes_per_param = 4.0
+
+    print(f"Config: dim={config.dim}, layers={config.n_layers}, heads={config.n_heads}")
+
+    # Calculate theoretical limits
+    avg_context_len = 50 if model_path else 20
+    theoretical = TheoreticalLimits(
+        n_heads=config.n_heads,
+        n_kv_heads=config.n_kv_heads,
+        head_dim=config.head_dim,
+        context_len=avg_context_len,
+        batch_size=1,
+        gpu=gpu,
+        n_layers=config.n_layers,
+        dim=config.dim,
+        vocab_size=config.vocab_size,
+        total_params=total_params,
+        bytes_per_param=bytes_per_param,
+    )
+
+    print("\n" + "=" * 50)
+    print("Theoretical Limits")
+    print("=" * 50)
+    print(f"Full model max (batch=1): {theoretical.max_tokens_per_sec_full_model:,.0f} tok/s ({theoretical.full_model_bottleneck}-bound)")
 
     # Warmup - run multiple times with various batch sizes
+    print("\n" + "=" * 50)
+    print("Benchmarks")
+    print("=" * 50)
     print("\nWarming up (5 runs)...")
     for i in range(5):
         engine = LLMEngine(model, tokenizer, max_batch_size=4)
@@ -102,15 +153,32 @@ def run_scalability_benchmark():
 
     # Throughput vs batch size
     print("\n### Throughput vs Concurrent Requests (avg of 2 runs) ###")
-    print("| Requests | Tokens | Time (s) | Tok/sec | Req/sec |")
-    print("|----------|--------|----------|---------|---------|")
+    print("| Requests | Tokens | Time (s) | Tok/sec | Req/sec | Util % |")
+    print("|----------|--------|----------|---------|---------|--------|")
 
-    max_tokens = 15
+    max_tokens = 10 if model_path else 15
+    request_counts = [1, 2, 4] if model_path else [1, 2, 4, 8, 16]
     results = []
-    for n_req in [1, 2, 4, 8, 16]:
+    for n_req in request_counts:
+        # Calculate theoretical for this batch size
+        theo_batched = TheoreticalLimits(
+            n_heads=config.n_heads,
+            n_kv_heads=config.n_kv_heads,
+            head_dim=config.head_dim,
+            context_len=avg_context_len,
+            batch_size=n_req,
+            gpu=gpu,
+            n_layers=config.n_layers,
+            dim=config.dim,
+            vocab_size=config.vocab_size,
+            total_params=total_params,
+            bytes_per_param=bytes_per_param,
+        )
         result = measure_throughput_avg(model, tokenizer, n_req, max_tokens, runs=2)
+        result["utilization"] = theo_batched.utilization_full_model(result["tokens_per_sec"])
         results.append(result)
-        print(f"| {result['n_requests']:8} | {result['total_tokens']:6} | {result['elapsed_sec']:8.2f} | {result['tokens_per_sec']:7.1f} | {result['requests_per_sec']:7.2f} |")
+        util_str = f"{result['utilization']:.1f}" if result['utilization'] >= 0.1 else f"{result['utilization']:.2f}"
+        print(f"| {result['n_requests']:8} | {result['total_tokens']:6} | {result['elapsed_sec']:8.2f} | {result['tokens_per_sec']:7.1f} | {result['requests_per_sec']:7.2f} | {util_str:>5}% |")
 
     # Calculate scaling efficiency
     print("\n### Scaling Efficiency ###")
@@ -129,23 +197,44 @@ def run_scalability_benchmark():
     print("| Requests | KV Cache Memory |")
     print("|----------|-----------------|")
 
-    for n_req in [1, 2, 4, 8, 16]:
+    mem_request_counts = [1, 2, 4] if model_path else [1, 2, 4, 8, 16]
+    for n_req in mem_request_counts:
         engine = LLMEngine(model, tokenizer, max_batch_size=n_req)
         params = SamplingParams(max_tokens=10, temperature=0.0)
 
         for i in range(n_req):
-            engine.add_request(f"Test {i}", params)
+            prompt = f"Hello {i}" if model_path else f"Test {i}"
+            engine.add_request(prompt, params)
 
         # Run a few steps
-        for _ in range(8):
+        steps = 5 if model_path else 8
+        for _ in range(steps):
             if not engine.has_unfinished():
                 break
             engine.step()
 
         mem_bytes = engine.kv_cache.get_memory_bytes()
-        mem_kb = mem_bytes / 1024
-        print(f"| {n_req:8} | {mem_kb:13.1f} KB |")
+        if mem_bytes > 1024 * 1024:
+            mem_str = f"{mem_bytes / (1024 * 1024):.1f} MB"
+        else:
+            mem_str = f"{mem_bytes / 1024:.1f} KB"
+        print(f"| {n_req:8} | {mem_str:>15} |")
+
+
+    # Summary
+    if model_path:
+        print("\n### Summary ###")
+        best_result = max(results, key=lambda r: r["tokens_per_sec"])
+        print(f"Best throughput: {best_result['tokens_per_sec']:.1f} tok/s at {best_result['n_requests']} concurrent requests")
+        print(f"Theoretical max: {theoretical.max_tokens_per_sec_full_model:,.0f} tok/s")
+        print(f"Utilization: {best_result['utilization']:.1f}%")
+
+    if config.dim < 512:
+        print("\nNOTE: Small test model - use --model models/tinyllama for realistic benchmarks.")
 
 
 if __name__ == "__main__":
-    run_scalability_benchmark()
+    parser = argparse.ArgumentParser(description="Scalability benchmark")
+    parser.add_argument("--model", type=str, help="Path to model directory")
+    args = parser.parse_args()
+    run_scalability_benchmark(model_path=args.model)
