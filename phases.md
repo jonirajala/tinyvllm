@@ -369,19 +369,14 @@ Portable tinygrad-native solution. BlockManager already exists with tests.
 
 ### Phase 5: Custom Kernels (~200 lines)
 
-Backend-specific optimized kernels for maximum performance.
+Metal kernel for Apple Silicon. CUDA kernel deferred to Phase 6.
 
 5.1 Metal Kernel (Apple Silicon)
 - Fused paged attention (gather + matmul in one kernel)
 - Direct block addressing without copy
 - Use tinygrad's MetalProgram API
 
-5.2 CUDA Kernel (NVIDIA)
-- Fused paged attention for CUDA
-- Optimized memory access patterns
-- Use tinygrad's CUDAProgram API
-
-5.3 Kernel Integration
+5.2 Kernel Integration
 - Auto-detect backend and select kernel
 - Fallback to portable Tensor.stack() if no kernel
 - Benchmark: measure speedup vs portable solution
@@ -392,85 +387,123 @@ Backend-specific optimized kernels for maximum performance.
 
 6.1 Prefill Optimization
 - Chunked prefill (don't block on long prompts)
-- Parallel prefill for batch
+- Batched prefill (process multiple prefill sequences together, currently one-by-one)
 - Flash attention for prefill
 
 6.2 Decode Optimization
 - CUDA graphs (capture and replay)
-- Fused kernels (RMSNorm + attention)
+- Fused kernels (RMSNorm + Linear, RoPE + Projection)
 - Memory-efficient attention
+- KV cache write batching (batch realizes instead of per-token)
 
 6.3 Sampling Optimization
-- Batched sampling
-- Top-p/top-k on GPU
-- Avoid CPU-GPU sync
+- Batched sampling across sequences (currently single token at a time)
+- Top-p/top-k on GPU (currently converts to CPU list)
+- Remove .realize().tolist() sync points in sampling.py (lines 26, 44, 62, 79, 120)
 
 6.4 Memory Optimization
 - LRU eviction (least recently used)
-- Preemption (pause low-priority requests)
+- Memory defragmentation/compaction (prevent external fragmentation)
 - CPU swap (move blocks to CPU when GPU full)
+- Attention mask caching (reuse masks for common patterns)
+
+6.5 Metal Kernel Optimizations
+- Pre-allocate output buffer once (reuse instead of Tensor.zeros() each call)
+- Cache Metal buffer references (avoid uop tree traversal every call)
+- Reuse block table tensor (overwrite values instead of new Tensor each call)
+- Reuse context_lens tensor (pre-allocate [max_batch] tensor)
+- Larger threadgroups with shared memory (32+ threads per head cooperating)
+- Vectorized loads (float4 instead of scalar float reads)
+- Loop unrolling (unroll head_dim loops for instruction-level parallelism)
+
+6.6 CUDA Kernel (NVIDIA)
+- Fused paged attention for CUDA
+- Optimized memory access patterns
+- Use tinygrad's CUDAProgram API
 
 ---
 
-### Phase 7: API Server (~200 lines)
+### Phase 7: Advanced Features (Optional, ~400 lines)
 
-7.1 HTTP Server
-- FastAPI or simple HTTP server
-- POST /generate endpoint
-- Request validation
-- Async handling
-
-7.2 Streaming
-- Server-sent events (SSE)
-- Token-by-token streaming
-- Partial response handling
-
-7.3 OpenAI Compatibility (Optional)
-- POST /v1/completions
-- POST /v1/chat/completions
-- Response format matching
-- Usage statistics
-
----
-
-### Phase 8: Advanced Features (Optional, ~400 lines)
-
-8.1 Prefix Caching
+7.1 Prefix Caching
 - Hash prompt prefixes
 - Reuse KV cache for common prefixes
 - Cache eviction policy
 - Cache hit/miss tracking
 
-8.2 Speculative Decoding
+7.2 Speculative Decoding
 - Draft model integration
 - Parallel verification
 - Token acceptance/rejection
 - Speedup measurement
 
-8.3 Multi-Sequence (Beam Search)
+7.3 Multi-Sequence (Beam Search)
 - Fork sequences (share prefix blocks)
-- Track multiple hypotheses
+- Sequence log probability tracking (needed for scoring)
+- Beam scoring and pruning
 - Merge/prune beams
 - Copy-on-write for blocks
 
+7.4 KV Cache Quantization
+- Support int8/float16 KV cache storage
+- Dequantization in attention kernel
+- 2-4x memory reduction for KV cache
+
+7.5 Request Scheduling
+- Priority scheduling (not just FCFS)
+- Request preemption (pause low-priority, resume high-priority)
+- Adaptive batch size based on memory/queue depth
+
+7.6 Generation Control
+- Stop string matching (beyond EOS token)
+- Constrained decoding (JSON schema, grammar)
+- Logit processors plugin system
+
+7.7 Metrics & Monitoring
+- Per-step timing (prefill time, decode time, sample time)
+- Token acceptance rate (for speculative decoding)
+- Cache hit rate (for prefix caching)
+- Memory profiling (used, free, fragmentation)
+
 ---
 
-### Phase 9: Multi-GPU Support (Optional, ~200 lines)
+### Phase 8: Multi-GPU Support (Optional, ~200 lines)
 
-9.1 Tensor Parallelism
+8.1 Tensor Parallelism
 - Split model layers across GPUs
 - All-reduce for layer outputs
 - Device placement for weights
 
-9.2 Sequence Parallelism
+8.2 Sequence Parallelism
 - Different sequences on different GPUs
 - KVCache per GPU
 - Load balancing across GPUs
 
-9.3 Pipeline Parallelism
+8.3 Pipeline Parallelism
 - Different layers on different GPUs
 - Micro-batching for pipeline efficiency
 - Async communication between stages
+
+---
+
+### Phase 9: API Server (~200 lines)
+
+9.1 HTTP Server
+- FastAPI or simple HTTP server
+- POST /generate endpoint
+- Request validation
+- Async handling
+
+9.2 Streaming
+- Server-sent events (SSE)
+- Token-by-token streaming
+- Partial response handling
+
+9.3 OpenAI Compatibility (Optional)
+- POST /v1/completions
+- POST /v1/chat/completions
+- Response format matching
+- Usage statistics
 
 ---
 
@@ -547,10 +580,13 @@ class GenerateRequest:
 | 4 | BlockManager integration | Memory tracked, OOM prevented |
 | 5 | Custom kernels faster | >1.5x speedup vs Tensor.stack() |
 | 6 | Chunked prefill works | Long prompts don't block other requests |
-| 7 | API works | curl POST /generate returns response |
-| 7 | Streaming works | Tokens arrive incrementally via SSE |
-| 8 | Prefix caching works | Repeated prefixes hit cache |
-| 9 | Multi-GPU works | Model runs across 2+ GPUs |
+| 6 | Batched sampling works | Sampling 16 sequences at once |
+| 7 | Prefix caching works | Repeated prefixes hit cache |
+| 7 | KV cache quantization works | int8 KV with <1% quality loss |
+| 7 | Stop strings work | Generation stops at custom string |
+| 8 | Multi-GPU works | Model runs across 2+ GPUs |
+| 9 | API works | curl POST /generate returns response |
+| 9 | Streaming works | Tokens arrive incrementally via SSE |
 
 ---
 

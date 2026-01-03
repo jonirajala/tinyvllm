@@ -9,8 +9,7 @@ from tinyvllm.core.attention_utils import (
     create_padding_mask,
     repeat_kv,
     attention,
-    paged_attention,
-    paged_attention_with_blocks,
+    prefill_attention,
 )
 from tinyvllm.core.kv_cache import KVCache
 from tinyvllm.core.block_manager import BlockManager
@@ -148,45 +147,8 @@ class TestAttention:
         assert 0.9 < out_mean < 1.1
 
 
-class TestPagedAttention:
-    def test_output_shape(self):
-        batch, q_len, n_heads, head_dim = 2, 4, 8, 64
-        kv_len = 6
-
-        q = Tensor.randn(batch, q_len, n_heads, head_dim)
-        k = Tensor.randn(batch, kv_len, n_heads, head_dim)
-        v = Tensor.randn(batch, kv_len, n_heads, head_dim)
-
-        out = paged_attention(q, k, v, context_lens=[kv_len, kv_len])
-        assert out.shape == (batch, q_len, n_heads, head_dim)
-
-    def test_with_gqa(self):
-        """Test grouped query attention (fewer KV heads than query heads)"""
-        batch, q_len, n_heads, head_dim = 1, 4, 8, 64
-        n_kv_heads = 2
-        kv_len = 6
-
-        q = Tensor.randn(batch, q_len, n_heads, head_dim)
-        k = Tensor.randn(batch, kv_len, n_kv_heads, head_dim)
-        v = Tensor.randn(batch, kv_len, n_kv_heads, head_dim)
-
-        out = paged_attention(q, k, v, context_lens=[kv_len])
-        assert out.shape == (batch, q_len, n_heads, head_dim)
-
-    def test_decode_single_token(self):
-        batch, n_heads, head_dim = 1, 4, 32
-        kv_len = 10
-
-        q = Tensor.randn(batch, 1, n_heads, head_dim)  # Single query token
-        k = Tensor.randn(batch, kv_len, n_heads, head_dim)
-        v = Tensor.randn(batch, kv_len, n_heads, head_dim)
-
-        out = paged_attention(q, k, v, context_lens=[kv_len], start_pos=kv_len - 1)
-        assert out.shape == (batch, 1, n_heads, head_dim)
-
-
-class TestPagedAttentionWithBlocks:
-    """Phase 4 tests for block-based paged attention."""
+class TestPrefillAttention:
+    """Tests for prefill_attention with block-based KV cache."""
 
     def test_basic_usage(self):
         """Test reading K/V from block-based cache."""
@@ -223,7 +185,7 @@ class TestPagedAttentionWithBlocks:
         query = Tensor.randn(1, 1, n_kv_heads, head_dim)  # [batch, q_len, heads, dim]
 
         # Run attention
-        out = paged_attention_with_blocks(
+        out = prefill_attention(
             query=query,
             kv_cache=cache,
             block_table=block_table,
@@ -268,7 +230,7 @@ class TestPagedAttentionWithBlocks:
         # Prefill query (all positions)
         query = Tensor.randn(1, prompt_len, n_kv_heads, head_dim)
 
-        out = paged_attention_with_blocks(
+        out = prefill_attention(
             query=query,
             kv_cache=cache,
             block_table=block_table,
@@ -325,7 +287,7 @@ class TestIntegration:
         block_table = block_manager.get_block_table(seq_id)
         context_len = block_manager.get_context_length(seq_id)
         query = Tensor.randn(1, prompt_len, n_heads, head_dim)
-        out = paged_attention_with_blocks(
+        out = prefill_attention(
             query, cache, block_table, context_len, layer_idx=0, start_pos=0
         )
         assert out.shape == (1, prompt_len, n_heads, head_dim)
@@ -346,7 +308,7 @@ class TestIntegration:
             block_table = block_manager.get_block_table(seq_id)
             context_len = block_manager.get_context_length(seq_id)
             query = Tensor.randn(1, 1, n_heads, head_dim)
-            out = paged_attention_with_blocks(
+            out = prefill_attention(
                 query, cache, block_table, context_len, layer_idx=0, start_pos=current_pos
             )
             assert out.shape == (1, 1, n_heads, head_dim)

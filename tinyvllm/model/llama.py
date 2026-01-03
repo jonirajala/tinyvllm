@@ -1,7 +1,6 @@
 """LLaMA model implementation using tinygrad.
 
-Phase 4: Integrates with BlockManager for slot allocation and
-block-based KVCache for storage.
+
 """
 
 from typing import Dict, List, Optional, Tuple
@@ -12,7 +11,8 @@ from tinygrad.nn import Embedding, Linear
 from .weights import LlamaConfig
 from ..core.kv_cache import KVCache
 from ..core.block_manager import BlockManager
-from ..core.attention_utils import paged_attention_with_blocks, batched_paged_attention
+from ..core.attention_utils import prefill_attention, decode_attention
+
 
 
 class RMSNorm:
@@ -119,7 +119,7 @@ class Attention:
         context_len = start_pos + seq_len
 
         # Compute attention reading from scattered blocks
-        out = paged_attention_with_blocks(
+        out = prefill_attention(
             q, kv_cache, block_table, context_len, layer_idx, start_pos
         )
 
@@ -231,7 +231,7 @@ class Attention:
             context_lens.append(start_pos + 1)
 
         # Batched attention
-        out = batched_paged_attention(
+        out = decode_attention(
             queries, kv_cache, block_tables, context_lens,
             layer_idx, start_positions
         )

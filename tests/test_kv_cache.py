@@ -1,4 +1,4 @@
-"""Tests for KVCache (Phase 4 block-based implementation)."""
+"""Tests for KVCache (Phase 5 flat tensor implementation)."""
 
 import pytest
 from tinygrad import Tensor, dtypes
@@ -17,12 +17,12 @@ class TestKVCacheInit:
             dtype=dtypes.float32
         )
 
-        # Should have block tensors for each layer
-        assert len(cache.k_blocks) == 4
-        assert len(cache.v_blocks) == 4
-        # Each layer should have num_blocks blocks
-        assert len(cache.k_blocks[0]) == 10
-        assert len(cache.v_blocks[0]) == 10
+        # Phase 5: Should have flat tensors per layer
+        assert len(cache.k_cache) == 4
+        assert len(cache.v_cache) == 4
+        # Each layer has [num_blocks, block_size, n_kv_heads, head_dim]
+        assert cache.k_cache[0].shape == (10, 16, 8, 64)
+        assert cache.v_cache[0].shape == (10, 16, 8, 64)
 
     def test_init_stores_params(self):
         cache = KVCache(
@@ -50,11 +50,10 @@ class TestKVCacheInit:
             dtype=dtypes.float32
         )
 
-        # Each block should have shape [block_size, n_kv_heads, head_dim]
+        # Phase 5: Each layer has flat tensor [num_blocks, block_size, n_kv_heads, head_dim]
         for layer_idx in range(2):
-            for block_id in range(4):
-                assert cache.k_blocks[layer_idx][block_id].shape == (8, 4, 32)
-                assert cache.v_blocks[layer_idx][block_id].shape == (8, 4, 32)
+            assert cache.k_cache[layer_idx].shape == (4, 8, 4, 32)
+            assert cache.v_cache[layer_idx].shape == (4, 8, 4, 32)
 
 
 class TestWriteKV:
@@ -73,8 +72,8 @@ class TestWriteKV:
 
         cache.write_kv(layer_idx=0, block_id=0, offset=0, k=k, v=v)
 
-        # Read back and verify
-        k_read = cache.k_blocks[0][0][0]  # First slot
+        # Phase 5: Read back from flat tensor [num_blocks, block_size, n_kv_heads, head_dim]
+        k_read = cache.k_cache[0][0, 0]  # First slot: [n_kv_heads, head_dim]
         assert k_read.sum().item() == 8  # 1 * 2 * 4
 
     def test_write_kv_multiple_positions(self):
@@ -95,7 +94,7 @@ class TestWriteKV:
 
         # Verify each position
         for i in range(5):
-            k_read = cache.k_blocks[0][0][i]
+            k_read = cache.k_cache[0][0, i]  # [block_id, offset]
             assert k_read.sum().item() == (i + 1) * 2 * 4
 
     def test_write_kv_multiple_blocks(self):
@@ -116,7 +115,7 @@ class TestWriteKV:
 
         # Verify each block
         for block_id in range(3):
-            k_read = cache.k_blocks[0][block_id][0]
+            k_read = cache.k_cache[0][block_id, 0]
             assert k_read.sum().item() == (block_id + 1) * 2 * 4
 
     def test_write_kv_multiple_layers(self):
@@ -137,7 +136,7 @@ class TestWriteKV:
 
         # Verify each layer
         for layer_idx in range(4):
-            k_read = cache.k_blocks[layer_idx][0][0]
+            k_read = cache.k_cache[layer_idx][0, 0]
             assert k_read.sum().item() == (layer_idx + 1) * 2 * 4
 
 
@@ -160,7 +159,7 @@ class TestWriteKVBatch:
 
         # Verify all 5 positions
         for i in range(5):
-            k_read = cache.k_blocks[0][0][i]
+            k_read = cache.k_cache[0][0, i]  # [block_id, offset]
             assert k_read.sum().item() == 8  # 1 * 2 * 4
 
     def test_write_kv_batch_with_offset(self):
@@ -181,7 +180,7 @@ class TestWriteKVBatch:
 
         # Verify positions 5, 6, 7 have the values
         for i in range(5, 8):
-            k_read = cache.k_blocks[0][0][i]
+            k_read = cache.k_cache[0][0, i]
             assert k_read.sum().item() == 5 * 2 * 4
 
 

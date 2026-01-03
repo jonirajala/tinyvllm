@@ -1,7 +1,8 @@
 """KV Cache with Block-based Storage.
 
-Phase 4: Pre-allocated block tensors for efficient paged attention.
-Each block is a separate realized tensor that accepts direct writes.
+Phase 5: Flat tensor storage for efficient kernel access.
+All blocks for a layer are stored in a single contiguous tensor,
+enabling fused paged attention kernels.
 """
 
 from typing import List, Tuple
@@ -12,13 +13,13 @@ from tinygrad.dtype import DType
 
 class KVCache:
     """
-    Block-based KV cache for Phase 4.
+    Block-based KV cache with flat tensor storage.
 
-    Storage: Pre-allocated block tensors per layer.
-        k_blocks[layer_idx][block_id] = Tensor[block_size, n_kv_heads, head_dim]
-        v_blocks[layer_idx][block_id] = Tensor[block_size, n_kv_heads, head_dim]
+    Phase 5: Stores all blocks in contiguous tensors per layer:
+        k_cache[layer_idx] = Tensor[num_blocks, block_size, n_kv_heads, head_dim]
+        v_cache[layer_idx] = Tensor[num_blocks, block_size, n_kv_heads, head_dim]
 
-    Each block is a separate realized tensor, allowing direct slice assignment.
+    This allows fused kernels to directly index into blocks without gathering.
     """
 
     def __init__(self, num_layers: int, num_blocks: int, block_size: int,
@@ -30,15 +31,14 @@ class KVCache:
         self.head_dim = head_dim
         self.dtype = dtype
 
-        # Pre-allocate block tensors - each block is separate realized tensor
-        self.k_blocks: List[List[Tensor]] = [
-            [Tensor.zeros(block_size, n_kv_heads, head_dim, dtype=dtype).contiguous().realize()
-             for _ in range(num_blocks)]
+        # Phase 5: Flat tensor storage - all blocks in single tensor per layer
+        # Shape: [num_blocks, block_size, n_kv_heads, head_dim]
+        self.k_cache: List[Tensor] = [
+            Tensor.zeros(num_blocks, block_size, n_kv_heads, head_dim, dtype=dtype).contiguous().realize()
             for _ in range(num_layers)
         ]
-        self.v_blocks: List[List[Tensor]] = [
-            [Tensor.zeros(block_size, n_kv_heads, head_dim, dtype=dtype).contiguous().realize()
-             for _ in range(num_blocks)]
+        self.v_cache: List[Tensor] = [
+            Tensor.zeros(num_blocks, block_size, n_kv_heads, head_dim, dtype=dtype).contiguous().realize()
             for _ in range(num_layers)
         ]
 
@@ -53,16 +53,17 @@ class KVCache:
             k: Key tensor [n_kv_heads, head_dim]
             v: Value tensor [n_kv_heads, head_dim]
         """
-        # Direct assignment works on realized tensors
-        self.k_blocks[layer_idx][block_id][offset] = k
-        self.k_blocks[layer_idx][block_id] = self.k_blocks[layer_idx][block_id].realize()
+        # Phase 5: Write to flat tensor [num_blocks, block_size, n_kv_heads, head_dim]
+        self.k_cache[layer_idx][block_id, offset] = k
+        self.k_cache[layer_idx] = self.k_cache[layer_idx].realize()
 
-        self.v_blocks[layer_idx][block_id][offset] = v
-        self.v_blocks[layer_idx][block_id] = self.v_blocks[layer_idx][block_id].realize()
+        self.v_cache[layer_idx][block_id, offset] = v
+        self.v_cache[layer_idx] = self.v_cache[layer_idx].realize()
 
     def write_kv_batch(self, layer_idx: int, block_id: int, start_offset: int, k: Tensor, v: Tensor):
         """
         Write K/V for multiple tokens to a block (for prefill).
+        in phase 6 we will batch write tokens to the KV cache.
 
         Args:
             layer_idx: Which transformer layer
@@ -71,15 +72,28 @@ class KVCache:
             k: Key tensor [num_tokens, n_kv_heads, head_dim]
             v: Value tensor [num_tokens, n_kv_heads, head_dim]
         """
-        num_tokens = k.shape[0]
-        end_offset = start_offset + num_tokens
+        end_offset = start_offset + k.shape[0] # start_position + num_tokens
 
-        # Write slice
-        self.k_blocks[layer_idx][block_id][start_offset:end_offset] = k
-        self.k_blocks[layer_idx][block_id] = self.k_blocks[layer_idx][block_id].realize()
+        self.k_cache[layer_idx][block_id, start_offset:end_offset] = k
+        self.k_cache[layer_idx] = self.k_cache[layer_idx].realize()
 
-        self.v_blocks[layer_idx][block_id][start_offset:end_offset] = v
-        self.v_blocks[layer_idx][block_id] = self.v_blocks[layer_idx][block_id].realize()
+        self.v_cache[layer_idx][block_id, start_offset:end_offset] = v
+        self.v_cache[layer_idx] = self.v_cache[layer_idx].realize()
+
+    def get_cache_tensors(self, layer_idx: int) -> Tuple[Tensor, Tensor]:
+        """
+        Get the flat K/V cache tensors for a layer.
+
+        Phase 5: Used by fused kernels for direct block access.
+
+        Args:
+            layer_idx: Which transformer layer
+
+        Returns:
+            k_cache: Tensor [num_blocks, block_size, n_kv_heads, head_dim]
+            v_cache: Tensor [num_blocks, block_size, n_kv_heads, head_dim]
+        """
+        return self.k_cache[layer_idx], self.v_cache[layer_idx]
 
     def read_kv_blocks(self, layer_idx: int, block_ids: List[int], context_len: int) -> Tuple[Tensor, Tensor]:
         """
@@ -95,14 +109,15 @@ class KVCache:
             v: Tensor [context_len, n_kv_heads, head_dim]
         """
         if not block_ids:
+            print("Warning: read_kv_blocks called with empty block_ids")
             return (
                 Tensor.zeros(0, self.n_kv_heads, self.head_dim, dtype=self.dtype),
                 Tensor.zeros(0, self.n_kv_heads, self.head_dim, dtype=self.dtype)
             )
 
-        # Stack all blocks: [num_blocks, block_size, n_kv_heads, head_dim]
-        k_stacked = Tensor.stack(*[self.k_blocks[layer_idx][bid] for bid in block_ids])
-        v_stacked = Tensor.stack(*[self.v_blocks[layer_idx][bid] for bid in block_ids])
+        # Phase 5: Index into flat tensors and stack
+        k_stacked = Tensor.stack(*[self.k_cache[layer_idx][bid] for bid in block_ids])
+        v_stacked = Tensor.stack(*[self.v_cache[layer_idx][bid] for bid in block_ids])
 
         # Reshape to [num_blocks * block_size, n_kv_heads, head_dim]
         total_slots = len(block_ids) * self.block_size

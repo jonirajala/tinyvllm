@@ -283,3 +283,92 @@ Phase 4 improvements:
 - Batched decode forward pass (multiple sequences in one call)
 - Result: **>2x throughput improvement** over sequential processing
 
+### Phase 5 (Custom Fused Kernels)
+
+Config: dim=64, n_layers=4, n_heads=4, max_tokens=20, 5 concurrent requests
+
+**METAL (Apple Silicon) - With Fused Paged Attention Kernel**
+| Benchmark | Tokens/sec | Requests/sec |
+|-----------|------------|--------------|
+| single_request | 10.2 | 0.51 |
+| sequential_5 | 12.7 | 0.64 |
+| concurrent_5 | 20.9 | 1.04 |
+
+Concurrent vs Sequential: **1.64x** speedup
+
+**CPU (Fallback tinygrad implementation)**
+| Benchmark | Tokens/sec | Requests/sec |
+|-----------|------------|--------------|
+| single_request | 4.8 | 0.24 |
+| sequential_5 | 11.1 | 0.66 |
+| concurrent_5 | 5.5 | 0.33 |
+
+Note: CPU fallback uses standard tinygrad ops without custom kernels.
+
+### Memory Usage (Phase 5)
+
+| Sequences | Tokens | KV Cache Memory | Bytes/Token |
+|-----------|--------|-----------------|-------------|
+| 1 | 18 | 64.0 KB | 3640 |
+| 2 | 36 | 128.0 KB | 3640 |
+| 5 | 90 | 320.0 KB | 3640 |
+| 10 | 144 | 512.0 KB | 3640 |
+
+Note: Memory usage unchanged from Phase 4 (same block-based allocation).
+
+### Latency (Phase 5)
+
+**METAL - With Fused Kernel**
+| Prompt Len | Tokens | TTFT (ms) | TPOT (ms) | E2E (ms) |
+|------------|--------|-----------|-----------|----------|
+| 3 | 10 | 311 | 65 | 893 |
+| 17 | 10 | 1096 | 66 | 1689 |
+| 51 | 10 | 2977 | 77 | 3667 |
+
+Summary: TTFT=197ms, TPOT=66ms, E2E=1117ms (15 tokens)
+
+**CPU**
+| Prompt Len | Tokens | TTFT (ms) | TPOT (ms) | E2E (ms) |
+|------------|--------|-----------|-----------|----------|
+| 3 | 10 | 453 | 152 | 1825 |
+| 17 | 10 | 1864 | 80 | 2581 |
+| 51 | 10 | 5294 | 231 | 7375 |
+
+Summary: TTFT=197ms, TPOT=69ms, E2E=1162ms (15 tokens)
+
+### Scalability (Phase 5)
+
+**METAL - Throughput vs Concurrent Requests**
+| Requests | Tok/sec | Efficiency |
+|----------|---------|------------|
+| 1 | 11.3 | 100% |
+| 2 | 17.8 | 79% |
+| 4 | 22.8 | 51% |
+| 8 | 24.6 | 27% |
+| 16 | 25.0 | 14% |
+
+**CPU - Throughput vs Concurrent Requests**
+| Requests | Tok/sec | Efficiency |
+|----------|---------|------------|
+| 1 | 8.7 | 100% |
+| 2 | 11.3 | 65% |
+| 4 | 13.0 | 37% |
+| 8 | 12.9 | 19% |
+| 16 | 11.8 | 8% |
+
+### Phase 5 vs Phase 4 Comparison
+
+| Metric | Phase 4 (Metal) | Phase 5 (Metal) | Improvement |
+|--------|-----------------|-----------------|-------------|
+| Single-request throughput | 4.5 tok/s | 10.2 tok/s | **2.3x** |
+| Concurrent (5 req) | 6.6 tok/s | 20.9 tok/s | **3.2x** |
+| TPOT | 134 ms | 66 ms | **2x faster** |
+| TTFT | 825 ms | 197 ms | **4.2x faster** |
+| Max throughput (16 req) | 6.0 tok/s | 25.0 tok/s | **4.2x** |
+
+Phase 5 improvements:
+- Custom Metal kernel for fused paged attention
+- Direct block table indexing (no Tensor.stack() overhead)
+- Flat tensor storage in KVCache for efficient kernel access
+- Backend dispatcher for Metal/CPU selection
+
