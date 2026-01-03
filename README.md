@@ -2,6 +2,8 @@
 - 1000 loc limit
 - Uses tinygrad
 
+python  -m tinyvllm.main --model ./models/tinyllama --prompt "The capital of France is" --max-tokens 20 --device metal
+
 ## what it vllm
 
 vLLM is an LLM inference engine that serves many users simultaneously by treating GPU memory like virtual memory.

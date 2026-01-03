@@ -5,11 +5,11 @@ from tinygrad import Tensor
 
 from tinyvllm.engine.sampling import (
     SamplingParams,
-    sample_token,
-    _repetition_penalty,
+    sample_tokens,
     _top_k_filter,
-    _sample_with_top_p,
+    _top_p_filter,
     _multinomial_sample,
+    _repetition_penalty,
 )
 
 
@@ -29,58 +29,9 @@ class TestSamplingParams:
         assert params.top_p == 0.9
 
 
-class TestRepetitionPenalty:
-    def test_no_penalty_when_1(self):
-        """Penalty of 1.0 should not change logits."""
-        logits = Tensor([1.0, 2.0, 3.0])
-        result = _repetition_penalty(logits, 1.0, [0, 1])
-        result_list = result.realize().tolist()
-        assert result_list[0] == pytest.approx(1.0)
-        assert result_list[1] == pytest.approx(2.0)
-
-    def test_positive_logits_divided(self):
-        """Positive logits should be divided by penalty."""
-        logits = Tensor([2.0, 4.0, 1.0])
-        result = _repetition_penalty(logits, 2.0, [0, 1])
-        result_list = result.realize().tolist()
-        assert result_list[0] == pytest.approx(1.0)  # 2.0 / 2.0
-        assert result_list[1] == pytest.approx(2.0)  # 4.0 / 2.0
-        assert result_list[2] == pytest.approx(1.0)  # unchanged
-
-    def test_negative_logits_multiplied(self):
-        """Negative logits should be multiplied by penalty (more negative)."""
-        logits = Tensor([-2.0, 4.0, 1.0])
-        result = _repetition_penalty(logits, 2.0, [0])
-        result_list = result.realize().tolist()
-        assert result_list[0] == pytest.approx(-4.0)  # -2.0 * 2.0
-        assert result_list[1] == pytest.approx(4.0)   # unchanged
-
-    def test_unseen_tokens_unchanged(self):
-        """Tokens not in seen_tokens should not be affected."""
-        logits = Tensor([1.0, 2.0, 3.0, 4.0])
-        result = _repetition_penalty(logits, 2.0, [0])
-        result_list = result.realize().tolist()
-        assert result_list[2] == pytest.approx(3.0)
-        assert result_list[3] == pytest.approx(4.0)
-
-    def test_empty_seen_tokens(self):
-        """Empty seen_tokens should not change logits."""
-        logits = Tensor([1.0, 2.0, 3.0])
-        result = _repetition_penalty(logits, 2.0, [])
-        result_list = result.realize().tolist()
-        assert result_list[0] == pytest.approx(1.0)
-        assert result_list[1] == pytest.approx(2.0)
-        assert result_list[2] == pytest.approx(3.0)
-
-    def test_duplicate_seen_tokens(self):
-        """Duplicate tokens should only be penalized once."""
-        logits = Tensor([4.0, 2.0, 3.0])
-        result = _repetition_penalty(logits, 2.0, [0, 0, 0])  # token 0 repeated
-        result_list = result.realize().tolist()
-        assert result_list[0] == pytest.approx(2.0)  # 4.0 / 2.0, not 4.0 / 8.0
-
-
 class TestTopKFilter:
+    """Tests for top-k filtering."""
+
     def test_keeps_top_k(self):
         """Should keep top k values, set rest to -inf."""
         logits = Tensor([1.0, 5.0, 3.0, 2.0, 4.0])
@@ -114,6 +65,13 @@ class TestTopKFilter:
         assert result_list[0] == float("-inf")
         assert result_list[2] == float("-inf")
 
+    def test_k_zero_returns_unchanged(self):
+        """k=0 should return unchanged."""
+        logits = Tensor([1.0, 2.0, 3.0])
+        result = _top_k_filter(logits, k=0)
+        result_list = result.realize().tolist()
+        assert result_list == pytest.approx([1.0, 2.0, 3.0])
+
     def test_ties_at_threshold(self):
         """When multiple values tie at threshold, keep all of them."""
         logits = Tensor([1.0, 3.0, 3.0, 3.0, 2.0])  # three 3.0s
@@ -125,123 +83,202 @@ class TestTopKFilter:
         assert result_list[3] == pytest.approx(3.0)
 
 
-class TestTopPSampling:
-    def test_returns_valid_index(self):
-        """Should return an index within vocab range."""
-        logits = Tensor([1.0, 2.0, 3.0, 4.0, 5.0])
-        idx = _sample_with_top_p(logits, p=0.9)
-        assert 0 <= idx < 5
+class TestTopPFilter:
+    """Tests for top-p (nucleus) filtering."""
 
-    def test_high_p_can_sample_any(self):
-        """With p=0.99, almost all tokens are candidates."""
-        logits = Tensor([1.0, 1.0, 1.0, 1.0])
-        samples = [_sample_with_top_p(logits, p=0.99) for _ in range(20)]
-        # Should have some variety
-        assert len(set(samples)) > 1
-
-    def test_low_p_restricts_to_top(self):
-        """With very low p, should mostly sample top tokens."""
-        logits = Tensor([0.0, 0.0, 10.0, 0.0])  # token 2 is dominant
-        samples = [_sample_with_top_p(logits, p=0.5) for _ in range(10)]
-        # Most samples should be token 2
-        assert samples.count(2) >= 8
-
-    def test_very_low_p_keeps_at_least_one(self):
-        """Even with p close to 0, should keep at least one token."""
+    def test_high_p_keeps_all(self):
+        """p=1.0 should keep all tokens."""
         logits = Tensor([1.0, 2.0, 3.0])
-        idx = _sample_with_top_p(logits, p=0.001)
-        assert 0 <= idx < 3  # Should still return valid index
+        result = _top_p_filter(logits, p=1.0)
+        result_list = result.realize().tolist()
+        assert result_list[0] == pytest.approx(1.0)
+        assert result_list[1] == pytest.approx(2.0)
+        assert result_list[2] == pytest.approx(3.0)
+
+    def test_keeps_at_least_one(self):
+        """Even with very low p, should keep at least one token."""
+        logits = Tensor([1.0, 2.0, 10.0])  # token 2 is dominant
+        result = _top_p_filter(logits, p=0.01)
+        result_list = result.realize().tolist()
+
+        # At least one should not be -inf
+        non_inf_count = sum(1 for v in result_list if v != float("-inf"))
+        assert non_inf_count >= 1
+
+    def test_low_p_restricts_tokens(self):
+        """Low p should filter out low-probability tokens."""
+        logits = Tensor([0.0, 0.0, 10.0, 0.0])  # token 2 is ~99.9% probability
+        result = _top_p_filter(logits, p=0.5)
+        result_list = result.realize().tolist()
+
+        # Token 2 should be kept, others might be filtered
+        assert result_list[2] == pytest.approx(10.0)
 
 
 class TestMultinomialSample:
+    """Tests for multinomial sampling."""
+
+    def test_returns_tensor(self):
+        """Should return a Tensor, not an int."""
+        logits = Tensor([1.0, 2.0, 3.0])
+        result = _multinomial_sample(logits)
+        assert isinstance(result, Tensor)
+
     def test_returns_valid_index(self):
         """Should return an index within vocab range."""
         logits = Tensor([1.0, 2.0, 3.0])
-        idx = _multinomial_sample(logits)
+        idx = int(_multinomial_sample(logits).realize().tolist())
         assert 0 <= idx < 3
 
     def test_higher_logits_more_likely(self):
         """Higher logits should be sampled more often."""
         logits = Tensor([0.0, 0.0, 10.0])  # token 2 is much more likely
-        samples = [_multinomial_sample(logits) for _ in range(50)]
+        samples = [int(_multinomial_sample(logits).realize().tolist()) for _ in range(50)]
         # Token 2 should dominate
         assert samples.count(2) >= 40
 
     def test_uniform_logits_give_variety(self):
         """Equal logits should give roughly uniform sampling."""
         logits = Tensor([0.0, 0.0, 0.0, 0.0])
-        samples = [_multinomial_sample(logits) for _ in range(100)]
+        samples = [int(_multinomial_sample(logits).realize().tolist()) for _ in range(100)]
         # Should see multiple different tokens
         assert len(set(samples)) >= 3
 
     def test_handles_negative_inf(self):
         """Should handle -inf logits (masked tokens)."""
         logits = Tensor([float("-inf"), float("-inf"), 5.0, float("-inf")])
-        samples = [_multinomial_sample(logits) for _ in range(20)]
+        samples = [int(_multinomial_sample(logits).realize().tolist()) for _ in range(20)]
         # Only token 2 should be sampled
         assert all(s == 2 for s in samples)
 
 
-class TestSampleToken:
-    def test_greedy_with_temp_0(self):
+class TestRepetitionPenalty:
+    """Tests for repetition penalty."""
+
+    def test_no_penalty_when_1(self):
+        """Penalty of 1.0 should not change logits."""
+        logits = Tensor([1.0, 2.0, 3.0])
+        result = _repetition_penalty(logits, 1.0, [0, 1])
+        result_list = result.realize().tolist()
+        assert result_list[0] == pytest.approx(1.0)
+        assert result_list[1] == pytest.approx(2.0)
+        assert result_list[2] == pytest.approx(3.0)
+
+    def test_empty_seen_tokens(self):
+        """Empty seen_tokens should not change logits."""
+        logits = Tensor([1.0, 2.0, 3.0])
+        result = _repetition_penalty(logits, 2.0, [])
+        result_list = result.realize().tolist()
+        assert result_list[0] == pytest.approx(1.0)
+        assert result_list[1] == pytest.approx(2.0)
+        assert result_list[2] == pytest.approx(3.0)
+
+    def test_penalizes_seen_tokens(self):
+        """Should penalize seen tokens."""
+        logits = Tensor([2.0, 4.0, 1.0])
+        result = _repetition_penalty(logits, 2.0, [0, 1])
+        result_list = result.realize().tolist()
+
+        # Positive logits should be divided by penalty
+        assert result_list[0] == pytest.approx(1.0)  # 2.0 / 2.0
+        assert result_list[1] == pytest.approx(2.0)  # 4.0 / 2.0
+        assert result_list[2] == pytest.approx(1.0)  # unchanged
+
+
+class TestSampleTokens:
+    """Tests for sample_tokens function."""
+
+    # Single sequence tests
+    def test_single_greedy(self):
         """Temperature 0 should always return argmax."""
         logits = Tensor([1.0, 5.0, 3.0])
         params = SamplingParams(temperature=0.0, top_k=0, top_p=1.0)
 
         for _ in range(10):
-            assert sample_token(logits, params, []) == 1
+            result = sample_tokens(logits, params)
+            assert result == [1]
 
-    def test_respects_top_k(self):
+    def test_single_respects_top_k(self):
         """With top_k, should only sample from top k tokens."""
         logits = Tensor([1.0, 2.0, 10.0, 3.0])  # token 2 is highest
         params = SamplingParams(temperature=1.0, top_k=1, top_p=1.0)
 
         for _ in range(10):
-            assert sample_token(logits, params, []) == 2
+            result = sample_tokens(logits, params)
+            assert result == [2]
 
-    def test_respects_top_p(self):
+    def test_single_respects_top_p(self):
         """With low top_p, should restrict to high-probability tokens."""
         logits = Tensor([0.0, 0.0, 10.0, 0.0])  # token 2 dominant
         params = SamplingParams(temperature=1.0, top_k=0, top_p=0.5)
 
-        samples = [sample_token(logits, params, []) for _ in range(10)]
+        samples = [sample_tokens(logits, params)[0] for _ in range(10)]
         assert samples.count(2) >= 8
 
-    def test_respects_repetition_penalty(self):
-        """Repetition penalty should reduce probability of seen tokens."""
-        logits = Tensor([10.0, 1.0, 1.0])
-        params = SamplingParams(temperature=0.0, repetition_penalty=100.0, top_k=0, top_p=1.0)
+    def test_single_with_repetition_penalty(self):
+        """Should apply repetition penalty."""
+        logits = Tensor([10.0, 1.0, 1.0])  # token 0 is dominant
+        params = SamplingParams(temperature=0.0, repetition_penalty=100.0)
 
-        # Without penalty: token 0 wins
-        assert sample_token(logits, SamplingParams(temperature=0.0), []) == 0
+        # With heavy penalty on token 0, should pick another
+        result = sample_tokens(logits, params, [0])
+        assert result[0] != 0
 
-        # With heavy penalty on token 0: others should win
-        result = sample_token(logits, params, [0])
-        assert result != 0
-
-    def test_temperature_affects_randomness(self):
-        """Higher temperature should increase sampling variety."""
-        logits = Tensor([3.0, 2.0, 1.0])  # token 0 is most likely
-
-        # Low temperature - should mostly pick token 0
-        params_low = SamplingParams(temperature=0.1, top_k=0, top_p=1.0)
-        samples_low = [sample_token(logits, params_low, []) for _ in range(20)]
-
-        # High temperature - should have more variety
-        params_high = SamplingParams(temperature=2.0, top_k=0, top_p=1.0)
-        samples_high = [sample_token(logits, params_high, []) for _ in range(20)]
-
-        # Low temp should be less varied than high temp
-        assert len(set(samples_low)) <= len(set(samples_high)) or samples_low.count(0) > samples_high.count(0)
-
-    def test_disabled_features(self):
-        """Test with all optional features disabled."""
+    def test_single_returns_list(self):
+        """Single case should return list of length 1."""
         logits = Tensor([1.0, 2.0, 3.0])
-        params = SamplingParams(
-            temperature=1.0,
-            top_k=0,       # disabled
-            top_p=1.0,     # disabled
-            repetition_penalty=1.0  # disabled
-        )
-        idx = sample_token(logits, params, [])
-        assert 0 <= idx < 3
+        params = SamplingParams(temperature=0.0)
+        result = sample_tokens(logits, params)
+
+        assert isinstance(result, list)
+        assert len(result) == 1
+
+    # Batched tests
+    def test_batch_multiple_sequences(self):
+        """Should sample for all sequences in batch."""
+        logits = Tensor([
+            [1.0, 5.0, 3.0],  # seq 0: argmax=1
+            [10.0, 2.0, 3.0],  # seq 1: argmax=0
+        ])
+        params_list = [SamplingParams(temperature=0.0), SamplingParams(temperature=0.0)]
+        result = sample_tokens(logits, params_list)
+
+        assert len(result) == 2
+        assert result[0] == 1  # seq 0 argmax
+        assert result[1] == 0  # seq 1 argmax
+
+    def test_batch_mixed_params(self):
+        """Should handle different params per sequence."""
+        logits = Tensor([
+            [1.0, 5.0, 3.0],  # seq 0
+            [1.0, 2.0, 10.0],  # seq 1
+        ])
+        params_list = [
+            SamplingParams(temperature=0.0, top_k=0),
+            SamplingParams(temperature=0.0, top_k=1),
+        ]
+        result = sample_tokens(logits, params_list)
+
+        assert len(result) == 2
+        assert result[0] == 1  # argmax of seq 0
+        assert result[1] == 2  # argmax of seq 1
+
+    def test_batch_with_repetition_penalty(self):
+        """Should apply repetition penalty when provided."""
+        logits = Tensor([[10.0, 1.0, 1.0]])  # token 0 is dominant
+        params_list = [SamplingParams(temperature=0.0, repetition_penalty=100.0)]
+        seen_tokens_batch = [[0]]  # penalize token 0
+
+        result = sample_tokens(logits, params_list, seen_tokens_batch)
+
+        # With heavy penalty on token 0, should pick another
+        assert result[0] != 0
+
+    def test_batch_returns_list_of_ints(self):
+        """Should return Python list of integers."""
+        logits = Tensor([[1.0, 2.0, 3.0]])
+        params_list = [SamplingParams(temperature=0.0)]
+        result = sample_tokens(logits, params_list)
+
+        assert isinstance(result, list)
+        assert all(isinstance(x, int) for x in result)

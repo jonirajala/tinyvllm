@@ -322,7 +322,8 @@ class PagedAttentionMetal:
         # NOTE: We bypass tinygrad's lazy evaluation by writing directly to GPU buffers.
         # The Metal kernel writes into output's buffer, which tinygrad doesn't track.
         # This is necessary because tinygrad can't fuse block-table gathering + attention.
-        output = Tensor.zeros(batch_size, n_heads, head_dim)
+        # IMPORTANT: Must realize() before get_metal_buffer() so tinygrad sees our writes
+        output = Tensor.zeros(batch_size, n_heads, head_dim).contiguous().realize()
 
         q_buf = get_metal_buffer(queries.reshape(batch_size, n_heads, head_dim))
         k_buf = get_metal_buffer(k_cache)

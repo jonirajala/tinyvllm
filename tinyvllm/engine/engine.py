@@ -47,7 +47,7 @@ from ..core.scheduler import Scheduler
 from ..core.sequence import Request, Sequence
 from ..core.block_manager import BlockManager
 from ..core.kv_cache import KVCache
-from ..engine.sampling import SamplingParams, sample_token
+from ..engine.sampling import SamplingParams, sample_tokens
 
 
 @dataclass
@@ -225,11 +225,12 @@ class LLMEngine:
                 block_manager=self.block_manager,
                 seq_id=seq.seq_id
             )
-            next_token = sample_token(
+            # Sample next token
+            next_token = sample_tokens(
                 logits[0, -1, :],
                 request.sampling_params,
                 seq.get_all_tokens()
-            )
+            )[0]
             seq_outputs[seq.seq_id] = next_token
 
             finish_reason = self._check_finished(next_token, seq, request)
@@ -264,14 +265,16 @@ class LLMEngine:
                 start_positions=start_positions
             )
 
-            # Sample tokens for each sequence
+            # Sample tokens for entire batch at once
+            batch_logits = logits[:, 0, :]  # [batch, vocab_size]
+            params_list = [self.requests[s.request_id].sampling_params for s in decode_seqs]
+            seen_tokens_batch = [s.get_all_tokens() for s in decode_seqs]
+            next_tokens = sample_tokens(batch_logits, params_list, seen_tokens_batch)
+
+            # Process results
             for i, seq in enumerate(decode_seqs):
+                next_token = next_tokens[i]
                 request = self.requests[seq.request_id]
-                next_token = sample_token(
-                    logits[i, 0, :],
-                    request.sampling_params,
-                    seq.get_all_tokens()
-                )
                 seq_outputs[seq.seq_id] = next_token
 
                 finish_reason = self._check_finished(next_token, seq, request)
