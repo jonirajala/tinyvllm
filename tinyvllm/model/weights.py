@@ -61,6 +61,7 @@ class LlamaConfig:
         norm_eps: float = 1e-5,
         max_seq_len: int = 2048,
         rope_theta: float = 10000.0,
+        dtype: str = "float32",  # "float32" or "float16"
     ):
         self.dim = dim
         self.n_layers = n_layers
@@ -72,9 +73,13 @@ class LlamaConfig:
         self.max_seq_len = max_seq_len
         self.rope_theta = rope_theta
         self.head_dim = dim // n_heads
+        # Model dtype for weights and KV cache
+        # Note: Only float16 and float32 supported on Metal (bfloat16 → float32)
+        # TODO: Add bfloat16 support when CUDA backend is implemented
+        self.dtype = dtypes.float16 if dtype == "float16" else dtypes.float32
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "LlamaConfig":
+    def from_dict(cls, d: Dict[str, Any], dtype: str = "float32") -> "LlamaConfig":
         """Create config from dictionary."""
         return cls(
             dim=d.get("hidden_size", d.get("dim", 4096)),
@@ -86,33 +91,60 @@ class LlamaConfig:
             norm_eps=d.get("rms_norm_eps", d.get("norm_eps", 1e-5)),
             max_seq_len=d.get("max_position_embeddings", d.get("max_seq_len", 2048)),
             rope_theta=d.get("rope_theta", 10000.0),
+            dtype=dtype,
         )
 
     @classmethod
-    def from_json(cls, path: Path) -> "LlamaConfig":
+    def from_json(cls, path: Path, dtype: str = "float32") -> "LlamaConfig":
         """Load config from JSON file."""
         with open(path) as f:
-            return cls.from_dict(json.load(f))
+            return cls.from_dict(json.load(f), dtype=dtype)
 
 
-def load_llama_weights(model_path: Path) -> tuple[LlamaConfig, Dict[str, Tensor]]:
+def _detect_dtype(weights: Dict[str, Tensor], dtype: str) -> str:
+    """Detect or validate dtype from weights.
+
+    Auto-detection:
+      - float16 weights → float16 (native Metal support)
+      - bfloat16/float32 weights → float32
+
+    Validation (when dtype is explicit):
+      - Prevents lossy conversions (bfloat16 → float16, float32 → float16)
+
+    TODO: When CUDA support is added, bfloat16 can be used natively
+    """
+    first_weight = next(iter(weights.values()))
+    weight_dtype = first_weight.dtype
+
+    # prevent bf16 since no bf16 support on Metal
+    if dtype == "auto":
+        return "float16" if weight_dtype == dtypes.float16 else "float32"
+
+    # Validate explicit dtype selection
+    if dtype == "float16" and weight_dtype != dtypes.float16:
+        raise ValueError(
+            f"Cannot use dtype='float16' with {weight_dtype} weights. "
+            f"This would lose precision. Use dtype='float32' or dtype='auto'."
+        )
+
+    return dtype
+
+
+def load_llama_weights(model_path: Path, dtype: str = "auto") -> tuple[LlamaConfig, Dict[str, Tensor]]:
     """
     Load LLaMA weights from a directory or file.
 
     Supports:
     - Directory with config.json and .safetensors files
     - Single .safetensors file (requires separate config)
+
+    Args:
+        model_path: Path to model directory or safetensors file
+        dtype: "float32", "float16", or "auto" (detect from weights)
     """
     model_path = Path(model_path)
 
     if model_path.is_dir():
-        # Load config
-        config_path = model_path / "config.json"
-        if config_path.exists():
-            config = LlamaConfig.from_json(config_path)
-        else:
-            raise FileNotFoundError(f"No config.json found in {model_path}")
-
         # Load weights from safetensors files
         weights = {}
         for sf_path in sorted(model_path.glob("*.safetensors")):
@@ -121,14 +153,25 @@ def load_llama_weights(model_path: Path) -> tuple[LlamaConfig, Dict[str, Tensor]
         if not weights:
             raise FileNotFoundError(f"No .safetensors files found in {model_path}")
 
+        dtype = _detect_dtype(weights, dtype)
+
+        # Load config with detected dtype
+        config_path = model_path / "config.json"
+        if config_path.exists():
+            config = LlamaConfig.from_json(config_path, dtype=dtype)
+        else:
+            raise FileNotFoundError(f"No config.json found in {model_path}")
+
         return config, weights
 
     elif model_path.suffix == ".safetensors":
         # Single file - need config in same directory
         weights = load_safetensors(model_path)
+        dtype = _detect_dtype(weights, dtype)
+
         config_path = model_path.parent / "config.json"
         if config_path.exists():
-            config = LlamaConfig.from_json(config_path)
+            config = LlamaConfig.from_json(config_path, dtype=dtype)
         else:
             raise FileNotFoundError(f"No config.json found for {model_path}")
         return config, weights

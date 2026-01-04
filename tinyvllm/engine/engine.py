@@ -125,14 +125,14 @@ class LLMEngine:
             block_size=block_size,
         )
 
-        # Phase 4: Create block-based KVCache
+        # Phase 4: Create block-based KVCache (uses model dtype for FP16 support)
         self.kv_cache = KVCache(
             num_layers=model.config.n_layers,
             num_blocks=num_blocks,
             block_size=block_size,
             n_kv_heads=model.config.n_kv_heads,
             head_dim=model.config.head_dim,
-            dtype=dtypes.float32,
+            dtype=model.config.dtype,
         )
 
         # Phase 4: Scheduler with BlockManager integration

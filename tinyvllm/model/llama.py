@@ -422,20 +422,25 @@ class Llama:
         return self.output(self.norm(h))
 
     def load_weights(self, weights: Dict[str, Tensor]):
-        """Load pretrained weights into the model."""
+        """Load pretrained weights into the model.
+
+        Weights are cast to config.dtype (auto-detected or explicit).
+        Uses replace() to change dtype, not assign() which preserves target dtype.
+        """
         # Map weight names to model attributes
         weight_map = self._build_weight_map()
+        target_dtype = self.config.dtype
 
         for name, tensor in weights.items():
-            if name in weight_map:
-                target = weight_map[name]
-                target.assign(tensor.cast(target.dtype))
-            else:
+            target_name = name
+            if name not in weight_map:
                 # Try common name variations
-                mapped_name = self._map_weight_name(name)
-                if mapped_name in weight_map:
-                    target = weight_map[mapped_name]
-                    target.assign(tensor.cast(target.dtype))
+                target_name = self._map_weight_name(name)
+
+            if target_name in weight_map:
+                target = weight_map[target_name]
+                # Use replace() to change both data and dtype
+                target.replace(tensor.cast(target_dtype))
 
     def _build_weight_map(self) -> Dict[str, Tensor]:
         """Build mapping from weight names to tensors."""
