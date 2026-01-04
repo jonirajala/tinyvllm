@@ -272,6 +272,82 @@ Two types of request:
 
 ---
 
+## Recommended Priority Order (Based on Profiling)
+
+**Key Insight:** Profiling revealed the bottleneck is NOT kernel speed but framework overhead.
+Current: 1.9 tok/s achieved vs 55 tok/s theoretical (3.5% utilization).
+
+The original phase numbering below reflects logical grouping, not implementation priority.
+Use this priority order for maximum impact:
+
+### Priority Tier 1: Critical Path (Do These First)
+*Combined potential: 10-20x throughput improvement*
+
+| Priority | Item | Location | Impact | Rationale |
+|----------|------|----------|--------|-----------|
+| **P0** | TinyJit for decode | 7.9.1 | 2-5x | Eliminates per-step Python scheduling overhead |
+| **P1** | Weight Quantization (INT8) | 6.7 | 2x | Directly reduces memory bandwidth bottleneck |
+| **P2** | Multi-step Scheduling | 6.8 | 20-30% | Amortizes CPU overhead over N steps |
+| **P3** | Reduce Python→GPU copies | 7.9.2 | 2-3x | Weights being re-copied each step |
+
+### Priority Tier 2: Medium Impact
+*Combined potential: 30-50% additional improvement*
+
+| Priority | Item | Location | Impact | Rationale |
+|----------|------|----------|--------|-----------|
+| **P4** | Pre-allocated buffers | 7.9.4 | 10-20% | Avoid per-step tensor allocation |
+| **P5** | Async output processing | 6.10 | 8-10% | Overlap detokenization with GPU |
+| **P6** | Object pooling (CPU) | 6.11 | 10-15% | Reduce Python object churn |
+| **P7** | Weight Quantization (INT4) | 6.7 | 2x more | 4x total compression vs FP16 |
+
+### Priority Tier 3: Feature Additions
+*Important for functionality, less urgent for throughput*
+
+| Priority | Item | Location | Impact | Rationale |
+|----------|------|----------|--------|-----------|
+| **P8** | Flash Attention (prefill) | 7.8 | 2-4x prefill | Long context support |
+| **P9** | API Server | 9.1-9.2 | N/A | Enable real-world usage |
+| **P10** | Sampling optimizations | 6.1 | 10-20% | Currently sync points |
+
+### Priority Tier 4: Advanced/Optional
+*Implement after Tiers 1-3 are complete*
+
+| Priority | Item | Location | Impact | Rationale |
+|----------|------|----------|--------|-----------|
+| P11 | Speculative decoding | 7.2 | 2-3x | Requires draft model |
+| P12 | Prefix caching | 7.1 | Variable | Use-case dependent |
+| P13 | KV cache quantization | 7.4 | 2-4x memory | Longer sequences |
+| P14 | CUDA kernel | 6.6 | Platform | NVIDIA support |
+| P15 | Multi-GPU | 8.x | Scaling | Large models only |
+
+### Not Recommended (Skip These)
+
+| Item | Location | Reason |
+|------|----------|--------|
+| simdgroup_async_copy | 6.2.1 | API deprecated by Apple |
+| Buffer pooling | 6.2 | Tensors can't be recycled (removed) |
+| Tiled attention (decode) | 6.2 | Minimal gain, decode is bandwidth-bound |
+
+### Quick Reference: What's Done vs What's Next
+
+```
+✅ COMPLETED (Phases 1-5 + 6.2 partial):
+   - Foundation, Paged Attention, Continuous Batching
+   - Block-based KVCache, Custom Metal Kernels
+   - Online softmax (single-pass decode)
+
+🎯 NEXT PRIORITIES:
+   P0: TinyJit for decode loop (7.9.1)
+   P1: INT8 weight quantization (6.7)
+   P2: Multi-step scheduling (6.8)
+
+❌ SKIP:
+   - simdgroup_async_copy (deprecated)
+   - Buffer pooling (doesn't work)
+```
+
+---
+
 ## Full Implementation Roadmap
 
 ### Phase 1: Foundation (~400 lines)
@@ -413,21 +489,141 @@ High effort:
 - Online softmax (single pass instead of two-pass) ✅
 - Buffer pooling (reusable GPU memory pools) ❌ REMOVED - tensors returned to caller can't be pooled;
   profiling showed real bottleneck is Python→GPU copies and scheduling overhead, not allocation
-- Tiled attention (Flash Attention style blocking) -- deferred to Phase 7.x (prefill focus)
-- simdgroup_async_copy (overlap compute and memory loads, M1+) -- deferred to Phase 6.2.1
+- Tiled attention (Flash Attention style blocking) -- deferred to Phase 7.x (prefill focus) ❌
+- simdgroup_async_copy (overlap compute and memory loads, M1+) -- ❌ NOT RECOMMENDED (see 6.2.1 research)
 
-### Phase 6.2.1: simdgroup_async_copy (Future Research)
-**Status:** Deferred - undocumented Metal API requires research
+### Phase 6.2.1: simdgroup_async_copy (Research Complete)
+**Status:** ❌ NOT RECOMMENDED - API deprecated/blocked by Apple, alternatives exist
 
-Metal's simdgroup_async_copy provides async memory transfers from device to threadgroup memory,
-similar to CUDA's cp.async. Benefits:
-- Overlap memory loads with compute (double-buffering)
-- Hide memory latency during tile loading
+---
 
-Implementation requires:
-- Research undocumented API (available since A14/M1)
-- May require AIR (Apple IR) compilation workarounds
-- Most effective when combined with tiled attention
+#### Research Summary
+
+**What is simdgroup_async_copy?**
+Metal's undocumented equivalent to CUDA's `cp.async` instruction. Provides async memory transfers
+from device memory to threadgroup memory, enabling compute-memory overlap (double buffering).
+
+**API Signatures (from leaked Xcode 14.2 headers):**
+```metal
+// 1D async copy
+simdgroup_future<void> simdgroup_async_copy(
+    threadgroup T *dst, const device T *src, ulong n_elements);
+
+// 2D async copy (for matrices with stride)
+simdgroup_future<void> simdgroup_async_copy(
+    threadgroup T *dst, ulong dst_elements_per_row, ulong dst_element_stride,
+    metal::vec<uint64_t, 2> dst_tile_dimensions,
+    const device T *src, ulong src_elements_per_row, ulong src_element_stride,
+    metal::vec<uint64_t, 2> src_tile_dimensions,
+    metal::vec<int64_t, 2> offset_in_src_tile,
+    simdgroup_async_copy_clamp_mode clamp_mode);
+
+// Wait for completion
+void simdgroup_future<void>::wait() const thread;
+```
+
+---
+
+#### Timeline of API Availability
+
+| Date/Version | Status |
+|--------------|--------|
+| A14/M1 (2020) | Hardware support added |
+| Xcode 14.2 | Headers leaked (`metal_simdgroup_async`, `metal_simdgroup_future`) |
+| Xcode 14.3+ | Headers removed, API inaccessible |
+| 2024-2025 | `__asm("air.simdgroup_async_copy_*")` workaround available |
+| macOS 26 Beta 4 | `__asm` keyword disabled - workaround blocked |
+
+---
+
+#### Why Apple Removed It
+
+1. **Undefined behavior**: "Sometimes causes undefined behavior when simds within a
+   threadgroup try to communicate" - synchronization issues between simdgroups
+2. **Internal use only**: Apple uses it in MPS (`NDArrayMatrixMultiplyNNA14`) but
+   doesn't want to support it publicly
+3. **Compiler complexity**: Requires careful memory ordering semantics
+
+---
+
+#### Alternative Approaches (Recommended)
+
+**1. ThunderMittens Approach (Works without async copies)**
+From Stanford's ThunderKittens port to Metal:
+- "Async loads/stores are deprecated on M2s—they got things working without them"
+- Direct HBM-to-register loads work well due to M-series favorable bandwidth/compute ratio
+- M4 has 120 GB/s bandwidth vs 2.5 TFLOPS compute = memory latency not as critical as NVIDIA
+
+**2. Standard Tiled Flash Attention (Recommended for tinyvllm)**
+```
+Algorithm: Tiled Attention with Online Softmax
+
+// Load K/V tiles into threadgroup memory (synchronous)
+for each kv_tile:
+    threadgroup_barrier(mem_flags::mem_none);
+
+    // Load K tile to threadgroup memory
+    for (int i = lane; i < tile_size; i += 32):
+        tg_k[i] = device_k[tile_offset + i];
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Compute QK^T and online softmax (from threadgroup memory)
+    for each k in tile:
+        score = dot(q, tg_k[k])
+        // online softmax update...
+
+    // Load V tile while computing (overlap opportunity)
+    // Note: This is where async_copy would help, but standard
+    // approach still works well
+```
+
+**3. simd_matrix for Small Head Dims**
+For head_dim ≤ 64, use `metal::simd_matrix<T,8,8>` intrinsics:
+- Native 8x8 matrix multiply-accumulate
+- Avoids explicit threadgroup memory for small tiles
+- Used by MLX and ThunderMittens
+
+---
+
+#### Performance Impact Analysis
+
+| Approach | Benefit | Complexity |
+|----------|---------|------------|
+| simdgroup_async_copy | 10-20% decode speedup | Very High (deprecated) |
+| Tiled threadgroup memory | 5-15% decode speedup | Medium |
+| simd_matrix intrinsics | 10-20% for small heads | Medium |
+| Current online softmax | Already single-pass | Done ✅ |
+
+**Key insight from profiling:** Our bottleneck is Python→GPU scheduling overhead
+(2-20ms per batch), not kernel memory latency. Optimizing kernel memory access
+patterns provides diminishing returns until we fix the scheduling issue (Phase 7.9 TinyJit).
+
+---
+
+#### Recommendation for tinyvllm
+
+**Do NOT implement simdgroup_async_copy because:**
+1. API is deprecated/blocked - would break on future macOS versions
+2. Our current bottleneck is Python overhead, not kernel memory latency
+3. Alternatives (tiled attention, simd_matrix) provide similar benefits
+
+**Future work (Phase 7.x):**
+- Implement tiled Flash Attention for prefill (long sequences benefit from tiling)
+- Use simd_matrix for decode if head_dim ≤ 64
+- Focus on TinyJit first - much higher impact
+
+---
+
+#### References
+
+- [applegpu Issue #28](https://github.com/dougallj/applegpu/issues/28) - API documentation
+- [metal-flash-attention](https://github.com/philipturner/metal-flash-attention) - Working Metal FlashAttention
+- [ThunderMittens](https://hazyresearch.stanford.edu/blog/2024-11-28-tk-mlx) - Alternative without async copies
+- [llama.cpp Flash Attention](https://deepwiki.com/ggml-org/llama.cpp/7.4-flash-attention-and-optimizations) - Metal implementation
+- [Metal Shading Language Spec v4](https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf) - Official docs (no async copy)
+
+---
 
 6.3 Decode Optimization
 - KV cache write batching (batch realizes instead of per-token)
@@ -512,47 +708,10 @@ Trade-offs:
 - Con: New requests wait up to N steps for scheduling (higher TTFT at low load)
 - Configurable: N=1 for latency-sensitive, N=8+ for throughput
 
-6.9 FlashAttention for Prefill (HIGH IMPACT - from vLLM research)
+6.9 FlashAttention for Prefill
+**→ See 7.8 for full details** (consolidated to avoid duplication)
 **Impact: 2-4x prefill speedup, enables longer context**
-**Rationale:** Standard attention materializes O(n²) attention matrix. FlashAttention uses O(1) memory via tiling.
-
-Standard Attention Memory:
-```
-seq_len=2K: 2K × 2K × 4 bytes = 16 MB per head
-seq_len=8K: 8K × 8K × 4 bytes = 256 MB per head
-```
-
-FlashAttention Memory:
-```
-Any seq_len: ~constant (tile size only)
-```
-
-Algorithm (simplified):
-```
-for q_tile in Q_tiles:
-    running_max = -inf
-    running_sum = 0
-    running_output = 0
-
-    for kv_tile in KV_tiles:
-        # Compute attention for this tile
-        scores = q_tile @ kv_tile.T
-
-        # Online softmax update
-        new_max = max(running_max, scores.max())
-        scale = exp(running_max - new_max)
-
-        running_sum = running_sum * scale + exp(scores - new_max).sum()
-        running_output = running_output * scale + softmax(scores) @ v_tile
-        running_max = new_max
-
-    output_tile = running_output / running_sum
-```
-
-Implementation for Metal:
-- Adapt Metal FlashAttention (github.com/philipturner/metal-flash-attention)
-- Use simdgroup_matrix for tile operations
-- Block sizes: 8×8 or 16×16 tiles for M-series
+**Prerequisite:** Online softmax (completed in Phase 6.2)
 
 6.10 Async Output Processing (MEDIUM IMPACT - from vLLM research)
 **Impact: 8-10% throughput improvement**
@@ -831,65 +990,7 @@ For deeper GPU analysis, use Xcode Instruments:
 
 ---
 
-## File Structure
 
-```
-tinyvllm/
-├── __init__.py
-├── model/
-│   ├── llama.py           # LLaMA architecture
-│   ├── attention.py       # Paged attention
-│   └── sampling.py        # Token sampling
-├── core/
-│   ├── block_manager.py   # Block allocation
-│   ├── kv_cache.py        # Paged KV cache
-│   ├── scheduler.py       # Continuous batching
-│   └── sequence.py        # Request/sequence state
-├── engine/
-│   ├── engine.py          # Main engine loop
-│   └── async_engine.py    # Async wrapper
-├── api/
-│   ├── server.py          # HTTP server
-│   └── openai.py          # OpenAI compat
-└── utils/
-    ├── memory.py          # Memory tracking
-    └── tokenizer.py       # Tokenizer wrapper
-```
-
----
-
-## Key Data Structures
-
-```python
-@dataclass
-class Block:
-    block_id: int
-    ref_count: int = 0
-
-@dataclass
-class Sequence:
-    seq_id: int
-    prompt_tokens: list[int]
-    output_tokens: list[int]
-    block_table: list[int]      # Logical → physical block mapping
-    status: Literal["waiting", "running", "finished"]
-
-@dataclass
-class SchedulerOutput:
-    scheduled_seqs: list[Sequence]
-    blocks_to_swap_in: dict[int, int]   # CPU → GPU
-    blocks_to_swap_out: dict[int, int]  # GPU → CPU
-    blocks_to_copy: dict[int, int]      # For beam search
-
-@dataclass
-class GenerateRequest:
-    prompt: str
-    max_tokens: int = 256
-    temperature: float = 1.0
-    top_p: float = 1.0
-    stop: list[str] = None
-    stream: bool = False
-```
 
 ---
 
@@ -907,9 +1008,10 @@ class GenerateRequest:
 | 6 | Batched sampling works | Sampling 16 sequences at once |
 | 6.7 | **Weight quantization works** | **INT8 model loads, >1.5x throughput, <2% quality loss** |
 | 6.8 | Multi-step scheduling works | N=8 steps per schedule, >20% throughput gain |
-| 6.9 | FlashAttention prefill works | 2K+ context prefill in <1s, O(1) memory |
 | 6.10 | Async output processing works | Detokenization overlaps with GPU compute |
 | 6.11 | Object pooling works | No allocations in hot path, >10% throughput |
+| 7.8 | FlashAttention prefill works | 2K+ context prefill in <1s, O(1) memory |
+| **7.9.1** | **TinyJit decode works** | **>2x throughput, fixed-shape decode loop** |
 | 7 | Prefix caching works | Repeated prefixes hit cache |
 | 7 | KV cache quantization works | int8 KV with <1% quality loss |
 | 7 | Stop strings work | Generation stops at custom string |
@@ -917,18 +1019,4 @@ class GenerateRequest:
 | 8 | Multi-GPU works | Model runs across 2+ GPUs |
 | 9 | API works | curl POST /generate returns response |
 | 9 | Streaming works | Tokens arrive incrementally via SSE |
-
----
-
-## Dependencies (Minimal)
-
-Required:
-- tinygrad
-- safetensors (weight loading)
-- tiktoken (tokenizer, or sentencepiece)
-
-Optional:
-- fastapi (API server)
-- uvicorn (ASGI server)
-- triton (custom kernels)
 

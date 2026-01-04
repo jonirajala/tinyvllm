@@ -1,11 +1,27 @@
-"""Custom kernels for Phase 5/6 - backend selected by device name convention.
+"""Custom kernels for paged attention.
 
-Phase 6.2: Uses online softmax kernel with buffer pooling for Metal.
+- Metal: Custom Metal kernel with online softmax
+- Other: Pure tinygrad fallback (device-agnostic)
 """
 
-import importlib
 from tinygrad import Device
 
-_device = Device.DEFAULT.split(":")[0].lower()
-_module = importlib.import_module(f".paged_attention_{_device}", __package__)
-fused_paged_attention = _module.fused_paged_attention
+# Pure tinygrad versions (device-agnostic, works with TinyJit)
+from .paged_attention_tinygrad import fused_paged_attention_tinygrad
+from .paged_attention_tinygrad import fused_paged_attention_from_lists
+
+# Lazy kernel selection - checked at call time, not import time
+_metal_kernel = None
+
+def fused_paged_attention(*args, **kwargs):
+    """Select kernel based on current device."""
+    global _metal_kernel
+    device = Device.DEFAULT.split(":")[0].lower()
+
+    if device == "metal":
+        if _metal_kernel is None:
+            from .paged_attention_metal import fused_paged_attention as metal_impl
+            _metal_kernel = metal_impl
+        return _metal_kernel(*args, **kwargs)
+    else:
+        return fused_paged_attention_from_lists(*args, **kwargs)

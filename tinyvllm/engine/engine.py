@@ -48,6 +48,7 @@ from ..core.sequence import Request, Sequence
 from ..core.block_manager import BlockManager
 from ..core.kv_cache import KVCache
 from ..engine.sampling import SamplingParams, sample_tokens
+from ..engine.jit_decode import JitDecoder
 
 
 @dataclass
@@ -102,6 +103,7 @@ class LLMEngine:
         max_batch_size: int = 8,
         num_blocks: int = 100,
         block_size: int = 16,
+        use_jit: bool = False,
     ):
         """
         Initialize the engine.
@@ -112,11 +114,13 @@ class LLMEngine:
             max_batch_size: Maximum sequences per batch
             num_blocks: Number of KV cache blocks (Phase 4)
             block_size: Tokens per block (Phase 4)
+            use_jit: Enable JIT compilation for decode (Phase 7.1)
         """
         self.model = model
         self.tokenizer = tokenizer
         self.max_batch_size = max_batch_size
         self.block_size = block_size
+        self.use_jit = use_jit
 
         # Phase 4: Create BlockManager for memory allocation
         self.block_manager = BlockManager(
@@ -141,6 +145,19 @@ class LLMEngine:
 
         # Mappings
         self.requests: Dict[int, Request] = {}  # request_id -> Request
+
+        # Phase 7.1: JIT decoder (optional)
+        self.jit_decoder: Optional[JitDecoder] = None
+        if use_jit:
+            # max_context_len: typical prompt (50-100) + max_tokens (50-100)
+            # Default 256 is reasonable for most use cases
+            max_context = min(256, num_blocks * block_size)
+            self.jit_decoder = JitDecoder(
+                model=model,
+                kv_cache=self.kv_cache,
+                max_batch_size=max_batch_size,
+                max_context_len=max_context,
+            )
 
 
 
@@ -255,15 +272,23 @@ class LLMEngine:
                 seq_ids.append(seq.seq_id)
                 start_positions.append(seq.get_len() - 1)
 
-            # Batched forward pass
-            input_ids = Tensor(tokens_list).reshape(len(decode_seqs), 1)
-            logits = self.model.batched_decode(
-                input_ids,
-                kv_cache=self.kv_cache,
-                block_manager=self.block_manager,
-                seq_ids=seq_ids,
-                start_positions=start_positions
-            )
+            # Batched forward pass - use JIT decoder if enabled
+            if self.use_jit and self.jit_decoder is not None:
+                logits = self.jit_decoder.decode(
+                    block_manager=self.block_manager,
+                    tokens_list=tokens_list,
+                    seq_ids=seq_ids,
+                    start_positions=start_positions
+                )
+            else:
+                input_ids = Tensor(tokens_list).reshape(len(decode_seqs), 1)
+                logits = self.model.batched_decode(
+                    input_ids,
+                    kv_cache=self.kv_cache,
+                    block_manager=self.block_manager,
+                    seq_ids=seq_ids,
+                    start_positions=start_positions
+                )
 
             # Sample tokens for entire batch at once
             batch_logits = logits[:, 0, :]  # [batch, vocab_size]

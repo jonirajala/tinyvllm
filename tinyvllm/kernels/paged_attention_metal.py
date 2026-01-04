@@ -270,6 +270,7 @@ class PagedAttentionOnline:
     - Online softmax: Single pass over KV cache instead of two passes
     - Better memory locality (each K/V loaded once instead of twice)
     - Foundation for Flash Attention tiled variant
+    - Pre-allocated buffers to minimize sync points
     """
 
     _instance: Optional['PagedAttentionOnline'] = None
@@ -279,6 +280,10 @@ class PagedAttentionOnline:
     def __init__(self):
         self._compiled = False
         self._kv_buf_cache: Dict[int, Any] = {}
+        # Pre-allocated buffer pools (key: (batch, heads, dim, dtype))
+        self._output_pool: Dict[tuple, Tensor] = {}
+        self._bt_pool: Dict[tuple, Tensor] = {}
+        self._ctx_pool: Dict[tuple, Tensor] = {}
 
     @classmethod
     def get_instance(cls) -> 'PagedAttentionOnline':
@@ -309,6 +314,26 @@ class PagedAttentionOnline:
         if tensor_id not in self._kv_buf_cache:
             self._kv_buf_cache[tensor_id] = get_metal_buffer(tensor)
         return self._kv_buf_cache[tensor_id]
+
+    def _get_output_buffer(self, batch_size: int, n_heads: int, head_dim: int, dtype) -> Tensor:
+        """Get pre-allocated output buffer, creating if needed."""
+        key = (batch_size, n_heads, head_dim, dtype)
+        if key not in self._output_pool:
+            # Only realize once on first use
+            self._output_pool[key] = Tensor.zeros(batch_size, n_heads, head_dim, dtype=dtype).contiguous().realize()
+        return self._output_pool[key]
+
+    def _get_bt_buffer(self, size: int) -> Tensor:
+        """Get pre-allocated block table buffer."""
+        if size not in self._bt_pool:
+            self._bt_pool[size] = Tensor.zeros(size, dtype=dtypes.int32).contiguous().realize()
+        return self._bt_pool[size]
+
+    def _get_ctx_buffer(self, size: int) -> Tensor:
+        """Get pre-allocated context lens buffer."""
+        if size not in self._ctx_pool:
+            self._ctx_pool[size] = Tensor.zeros(size, dtype=dtypes.int32).contiguous().realize()
+        return self._ctx_pool[size]
 
     def batched(
         self,
@@ -351,24 +376,23 @@ class PagedAttentionOnline:
 
         use_fp16 = queries.dtype == dtypes.float16
 
-        # Create output buffer
-        output = Tensor.zeros(batch_size, n_heads, head_dim, dtype=queries.dtype).contiguous().realize()
+        # Reuse pre-allocated output buffer (no realize - already done once)
+        output = self._get_output_buffer(batch_size, n_heads, head_dim, queries.dtype)
 
-        # Pad block tables
+        # Block tables - create tensor but defer realize
         padded_tables = []
         for bt in block_tables:
             padded = bt + [0] * (max_blocks - len(bt))
             padded_tables.extend(padded)
 
-        # Create block table tensor (small, pooling overhead not worth it)
+        # Create tensors from Python lists
         pt_tensor = Tensor(padded_tables, dtype=dtypes.int32).contiguous().realize()
-        pt_buf = get_metal_buffer(pt_tensor)
-
-        # Create context lens tensor
         ctx_tensor = Tensor(context_lens, dtype=dtypes.int32).contiguous().realize()
+
+        pt_buf = get_metal_buffer(pt_tensor)
         ctx_buf = get_metal_buffer(ctx_tensor)
 
-        # Get buffers
+        # Get buffers (queries should already be realized from upstream)
         q_buf = get_metal_buffer(queries.reshape(batch_size, n_heads, head_dim))
         k_buf = self._get_cached_kv_buffer(k_cache)
         v_buf = self._get_cached_kv_buffer(v_cache)
@@ -377,7 +401,8 @@ class PagedAttentionOnline:
         # Select kernel
         program = self._program_fp16 if use_fp16 else self._program_fp32
 
-        # Dispatch
+        # Dispatch - don't wait unless we need the result immediately
+        # The next operation that needs the output will sync
         program(
             q_buf._buf,
             k_buf._buf,
@@ -388,7 +413,7 @@ class PagedAttentionOnline:
             global_size=(n_heads, batch_size, 1),
             local_size=(32, 1, 1),
             vals=(batch_size, max_blocks, block_size, n_heads, n_kv_heads, head_dim),
-            wait=True
+            wait=False  # Async dispatch - sync happens when output is used
         )
 
         return output.reshape(batch_size, 1, n_heads, head_dim)
@@ -396,3 +421,5 @@ class PagedAttentionOnline:
 
 # Export with standard name for dispatcher
 fused_paged_attention = PagedAttentionOnline.get_instance().batched
+
+# JIT-compatible version is in paged_attention_jit.py (device-agnostic)
