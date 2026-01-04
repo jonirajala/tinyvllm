@@ -2,7 +2,6 @@
 
 Phase 6.2 High Effort Optimizations:
 - Online softmax (single pass instead of two-pass)
-- Buffer pooling (reusable GPU memory pools)
 
 Online Softmax Algorithm:
 Instead of two passes (find max, then softmax+accumulate), we maintain
@@ -29,7 +28,7 @@ Kernel Constraints (same as original):
 - n_heads must be divisible by n_kv_heads (GQA requirement)
 """
 
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any
 from tinygrad import Tensor, Device, dtypes
 from tinygrad.runtime.ops_metal import MetalDevice, MetalCompiler, MetalProgram
 
@@ -52,48 +51,6 @@ def get_metal_buffer(tensor: Tensor):
     if buf is None:
         raise RuntimeError(f"Could not find realized buffer for tensor with shape {tensor.shape}")
     return buf
-
-
-class TensorPool:
-    """Pool of reusable tensors to avoid allocation overhead.
-
-    In the hot path of decode, we allocate tensors for:
-    - Output buffer: [batch_size, n_heads, head_dim]
-    - Block tables: [batch_size * max_blocks]
-    - Context lens: [batch_size]
-
-    These have predictable sizes and are created/destroyed every step.
-    Pooling avoids the Python/tinygrad allocation overhead.
-    """
-
-    def __init__(self):
-        self._pools: Dict[Tuple, List[Tensor]] = {}
-        self._stats = {"hits": 0, "misses": 0}
-
-    def acquire(self, shape: Tuple[int, ...], dtype=dtypes.float32) -> Tensor:
-        """Get a tensor from pool or create new one."""
-        key = (shape, dtype)
-        if self._pools.get(key):
-            self._stats["hits"] += 1
-            return self._pools[key].pop()
-        self._stats["misses"] += 1
-        return Tensor.zeros(*shape, dtype=dtype).contiguous().realize()
-
-    def release(self, tensor: Tensor):
-        """Return tensor to pool for reuse."""
-        key = (tensor.shape, tensor.dtype)
-        if key not in self._pools:
-            self._pools[key] = []
-        self._pools[key].append(tensor)
-
-    def clear(self):
-        """Clear all pooled tensors (for memory cleanup)."""
-        self._pools.clear()
-        self._stats = {"hits": 0, "misses": 0}
-
-    def get_stats(self) -> Dict[str, int]:
-        """Get pool statistics."""
-        return self._stats.copy()
 
 
 # =============================================================================
@@ -307,11 +264,12 @@ kernel void paged_attention_online_softmax_fp16(
 class PagedAttentionOnline:
     """Metal implementation of paged attention with online softmax.
 
-    Phase 6.2 High Effort: Single-pass attention with buffer pooling.
+    Phase 6.2 High Effort: Single-pass attention.
 
-    Improvements over PagedAttentionMetal:
+    Improvements over two-pass attention:
     - Online softmax: Single pass over KV cache instead of two passes
-    - Buffer pooling: Reuses output, block_table, and context_lens tensors
+    - Better memory locality (each K/V loaded once instead of twice)
+    - Foundation for Flash Attention tiled variant
     """
 
     _instance: Optional['PagedAttentionOnline'] = None
@@ -321,7 +279,6 @@ class PagedAttentionOnline:
     def __init__(self):
         self._compiled = False
         self._kv_buf_cache: Dict[int, Any] = {}
-        self._tensor_pool = TensorPool()
 
     @classmethod
     def get_instance(cls) -> 'PagedAttentionOnline':
@@ -352,14 +309,6 @@ class PagedAttentionOnline:
         if tensor_id not in self._kv_buf_cache:
             self._kv_buf_cache[tensor_id] = get_metal_buffer(tensor)
         return self._kv_buf_cache[tensor_id]
-
-    def get_pool_stats(self) -> Dict[str, int]:
-        """Get buffer pool statistics."""
-        return self._tensor_pool.get_stats()
-
-    def clear_pool(self):
-        """Clear buffer pool (useful for memory cleanup)."""
-        self._tensor_pool.clear()
 
     def batched(
         self,
@@ -402,8 +351,8 @@ class PagedAttentionOnline:
 
         use_fp16 = queries.dtype == dtypes.float16
 
-        # Use pooled output buffer
-        output = self._tensor_pool.acquire((batch_size, n_heads, head_dim), queries.dtype)
+        # Create output buffer
+        output = Tensor.zeros(batch_size, n_heads, head_dim, dtype=queries.dtype).contiguous().realize()
 
         # Pad block tables
         padded_tables = []
@@ -442,14 +391,7 @@ class PagedAttentionOnline:
             wait=True
         )
 
-        result = output.reshape(batch_size, 1, n_heads, head_dim)
-
-        # Note: We don't release output here because the caller needs it.
-        # The tensor pool is most useful when the same sizes are repeatedly needed.
-        # In practice, if batch_size varies, pooling is less effective.
-        # But for steady-state decode with fixed batch size, pooling helps.
-
-        return result
+        return output.reshape(batch_size, 1, n_heads, head_dim)
 
 
 # Export with standard name for dispatcher

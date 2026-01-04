@@ -411,7 +411,8 @@ Medium effort:
 
 High effort:
 - Online softmax (single pass instead of two-pass) ✅
-- Buffer pooling (reusable GPU memory pools) ✅
+- Buffer pooling (reusable GPU memory pools) ❌ REMOVED - tensors returned to caller can't be pooled;
+  profiling showed real bottleneck is Python→GPU copies and scheduling overhead, not allocation
 - Tiled attention (Flash Attention style blocking) -- deferred to Phase 7.x (prefill focus)
 - simdgroup_async_copy (overlap compute and memory loads, M1+) -- deferred to Phase 6.2.1
 
@@ -777,6 +778,10 @@ class LLMEngine:
         self.input_buffer = Tensor.zeros(max_batch, 1).realize()
         self.output_buffer = Tensor.zeros(max_batch, 1, vocab_size).realize()
 ```
+
+**Note:** Buffer pooling was attempted in Phase 6.2 but removed. The issue is that
+tensors flow through multiple functions and can't easily be recycled. TinyJit is
+the better solution as it caches the entire kernel graph, avoiding allocation overhead.
 
 7.9.5 Metal System Trace
 For deeper GPU analysis, use Xcode Instruments:
