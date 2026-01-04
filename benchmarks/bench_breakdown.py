@@ -52,12 +52,30 @@ class TimingStats:
         return self.total_ms / self.count if self.count > 0 else 0
 
     @property
+    def median_ms(self) -> float:
+        if not self.times:
+            return 0
+        sorted_times = sorted(self.times)
+        n = len(sorted_times)
+        if n % 2 == 0:
+            return (sorted_times[n//2 - 1] + sorted_times[n//2]) / 2
+        return sorted_times[n//2]
+
+    @property
     def min_ms(self) -> float:
         return min(self.times) if self.times else 0
 
     @property
     def max_ms(self) -> float:
         return max(self.times) if self.times else 0
+
+    @property
+    def std_ms(self) -> float:
+        if len(self.times) < 2:
+            return 0
+        avg = self.avg_ms
+        variance = sum((t - avg) ** 2 for t in self.times) / len(self.times)
+        return variance ** 0.5
 
 
 class BreakdownProfiler:
@@ -95,26 +113,28 @@ class BreakdownProfiler:
             self.stop()
 
     def report(self) -> str:
-        """Generate a timing report."""
+        """Generate a timing report using median for stability."""
         lines = []
-        total = sum(s.total_ms for s in self.stats.values())
+        # Use median-based total for more stable results
+        total_median = sum(s.median_ms * s.count for s in self.stats.values())
 
-        lines.append("=" * 70)
-        lines.append("TIMING BREAKDOWN")
-        lines.append("=" * 70)
-        lines.append(f"{'Operation':<30} {'Total (ms)':>10} {'Count':>8} {'Avg (ms)':>10} {'%':>8}")
-        lines.append("-" * 70)
+        lines.append("=" * 80)
+        lines.append("TIMING BREAKDOWN (median values for stability)")
+        lines.append("=" * 80)
+        lines.append(f"{'Operation':<25} {'Count':>6} {'Median':>10} {'Std':>8} {'Total':>10} {'%':>7}")
+        lines.append("-" * 80)
 
         # Sort by total time descending
-        sorted_stats = sorted(self.stats.values(), key=lambda s: s.total_ms, reverse=True)
+        sorted_stats = sorted(self.stats.values(), key=lambda s: s.median_ms * s.count, reverse=True)
 
         for stat in sorted_stats:
-            pct = (stat.total_ms / total * 100) if total > 0 else 0
-            lines.append(f"{stat.name:<30} {stat.total_ms:>10.1f} {stat.count:>8} {stat.avg_ms:>10.2f} {pct:>7.1f}%")
+            total_ms = stat.median_ms * stat.count
+            pct = (total_ms / total_median * 100) if total_median > 0 else 0
+            lines.append(f"{stat.name:<25} {stat.count:>6} {stat.median_ms:>10.2f} {stat.std_ms:>8.2f} {total_ms:>10.1f} {pct:>6.1f}%")
 
-        lines.append("-" * 70)
-        lines.append(f"{'TOTAL':<30} {total:>10.1f}")
-        lines.append("=" * 70)
+        lines.append("-" * 80)
+        lines.append(f"{'TOTAL':<25} {'':<6} {'':<10} {'':<8} {total_median:>10.1f}")
+        lines.append("=" * 80)
 
         return "\n".join(lines)
 
@@ -176,7 +196,8 @@ def benchmark_inference_breakdown(
     tokenizer,
     prompt: str = "Hello, how are you today?",
     max_tokens: int = 20,
-    warmup_runs: int = 2,
+    warmup_runs: int = 3,
+    benchmark_runs: int = 3,
 ) -> BreakdownProfiler:
     """
     Benchmark each step of inference with detailed timing.
@@ -420,17 +441,15 @@ def main():
     parser.add_argument("--prompt", type=str, default="Hello, how are you today? I would like to know more about",
                         help="Prompt to use")
     parser.add_argument("--max-tokens", type=int, default=20, help="Max tokens to generate")
+    parser.add_argument("--runs", type=int, default=3, help="Number of benchmark runs for averaging")
     parser.add_argument("--detailed", action="store_true", help="Show per-layer breakdown")
     args = parser.parse_args()
 
-    print("=" * 70)
+    print("=" * 80)
     print("tinyvllm Inference Breakdown Benchmark")
-    print("=" * 70)
+    print("=" * 80)
     print(f"Device: {Device.DEFAULT}")
-
-    # Memory before loading
-    mem_before = get_memory_info()
-    print(f"Memory before: {mem_before['rss_mb']:.1f} MB")
+    print(f"Runs: {args.runs} (using median for stability)")
 
     # Load model
     if args.model:
@@ -443,43 +462,48 @@ def main():
         tokenizer = create_mock_tokenizer(config.vocab_size)
         print(f"Model: {config.dim} dim, {config.n_layers} layers")
 
-    # Memory after loading
-    mem_after = get_memory_info()
-    print(f"Memory after load: {mem_after['rss_mb']:.1f} MB (+{mem_after['rss_mb'] - mem_before['rss_mb']:.1f} MB)")
-
-    # Run main benchmark
-    print("\n" + "=" * 70)
+    # Run benchmark multiple times and aggregate
+    print("\n" + "=" * 80)
     print("HIGH-LEVEL BREAKDOWN")
-    print("=" * 70)
+    print("=" * 80)
 
-    profiler, tokens, output = benchmark_inference_breakdown(
-        model, config, tokenizer,
-        prompt=args.prompt,
-        max_tokens=args.max_tokens,
-    )
+    # Aggregate profiler across runs
+    aggregate_profiler = BreakdownProfiler()
+    tokens = None
+    output = None
+
+    for run in range(args.runs):
+        print(f"\nRun {run + 1}/{args.runs}...")
+        profiler, tokens, output = benchmark_inference_breakdown(
+            model, config, tokenizer,
+            prompt=args.prompt,
+            max_tokens=args.max_tokens,
+        )
+        # Merge timing stats
+        for name, stat in profiler.stats.items():
+            if name not in aggregate_profiler.stats:
+                aggregate_profiler.stats[name] = TimingStats(name)
+            for t in stat.times:
+                aggregate_profiler.stats[name].record(t)
 
     print(f"\nGenerated {len(tokens)} tokens")
     print(f"Output: {output[:100]}...")
     print()
-    print(profiler.report())
+    print(aggregate_profiler.report())
 
-    # Calculate derived metrics
-    total_time = sum(s.total_ms for s in profiler.stats.values())
-    decode_time = profiler.stats.get("4. Decode forward", TimingStats("")).total_ms
-    num_decode_steps = profiler.stats.get("4. Decode forward", TimingStats("")).count
-
-    if num_decode_steps > 0:
-        print(f"\nDerived Metrics:")
-        print(f"  Total time: {total_time:.1f} ms")
-        print(f"  Decode steps: {num_decode_steps}")
-        print(f"  Avg decode latency: {decode_time / num_decode_steps:.2f} ms/token")
-        print(f"  Decode throughput: {num_decode_steps / (decode_time / 1000):.1f} tok/s")
+    # Calculate derived metrics using median
+    decode_stat = aggregate_profiler.stats.get("4. Decode forward", TimingStats(""))
+    if decode_stat.count > 0:
+        median_decode = decode_stat.median_ms
+        print(f"\nDerived Metrics (median):")
+        print(f"  Decode latency: {median_decode:.2f} ms/token (std: {decode_stat.std_ms:.2f})")
+        print(f"  Decode throughput: {1000 / median_decode:.1f} tok/s")
 
     # Detailed per-layer breakdown
     if args.detailed:
-        print("\n" + "=" * 70)
+        print("\n" + "=" * 80)
         print("PER-LAYER BREAKDOWN (decode only)")
-        print("=" * 70)
+        print("=" * 80)
 
         detail_profiler = benchmark_decode_components(
             model, config, tokenizer,
@@ -490,9 +514,9 @@ def main():
         print(detail_profiler.report())
 
         # Aggregate by component type
-        print("\n" + "=" * 70)
+        print("\n" + "=" * 80)
         print("AGGREGATED BY COMPONENT")
-        print("=" * 70)
+        print("=" * 80)
 
         aggregated = {}
         for name, stat in detail_profiler.stats.items():
@@ -505,7 +529,7 @@ def main():
 
             if key not in aggregated:
                 aggregated[key] = 0
-            aggregated[key] += stat.total_ms
+            aggregated[key] += stat.median_ms * stat.count
 
         total = sum(aggregated.values())
         print(f"{'Component':<30} {'Time (ms)':>10} {'%':>8}")
@@ -513,34 +537,6 @@ def main():
         for name, time_ms in sorted(aggregated.items(), key=lambda x: -x[1]):
             pct = time_ms / total * 100 if total > 0 else 0
             print(f"{name:<30} {time_ms:>10.1f} {pct:>7.1f}%")
-
-    print("\n" + "=" * 70)
-    print("BOTTLENECK ANALYSIS")
-    print("=" * 70)
-
-    # Identify bottleneck
-    sorted_stats = sorted(profiler.stats.items(), key=lambda x: -x[1].total_ms)
-    top = sorted_stats[0] if sorted_stats else None
-
-    if top:
-        print(f"\nPrimary bottleneck: {top[0]}")
-        print(f"  Time: {top[1].total_ms:.1f} ms ({top[1].total_ms / total_time * 100:.1f}% of total)")
-
-        if "Prefill" in top[0]:
-            print("\n  Suggestion: Prefill is dominant. For long prompts, consider:")
-            print("    - Chunked prefill (process prompt in chunks)")
-            print("    - Flash attention for prefill")
-            print("    - Prefix caching for repeated prompts")
-        elif "Decode" in top[0]:
-            print("\n  Suggestion: Decode is dominant. Consider:")
-            print("    - Speculative decoding (draft + verify)")
-            print("    - Model quantization (INT8/INT4)")
-            print("    - Larger batch sizes for throughput")
-        elif "Sampling" in top[0]:
-            print("\n  Suggestion: Sampling is slow. Consider:")
-            print("    - GPU-based sampling (avoid CPU sync)")
-            print("    - Batched sampling")
-
 
 if __name__ == "__main__":
     main()

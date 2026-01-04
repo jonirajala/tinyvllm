@@ -53,43 +53,60 @@ class MockTokenizer:
         return "".join(chr((t % 26) + ord("a")) for t in tokens if t > 2)
 
 
-def measure_latency_detailed(model, tokenizer, prompt: str, max_tokens: int) -> LatencyResult:
-    """Measure latency with per-token timing."""
-    params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
-    engine = LLMEngine(model, tokenizer)
-    engine.add_request(prompt, params)
+def measure_latency_detailed(model, tokenizer, prompt: str, max_tokens: int, runs: int = 3) -> LatencyResult:
+    """Measure latency with per-token timing, using median of multiple runs."""
+    all_ttft = []
+    all_tpot = []
+    all_e2e = []
+    num_tokens = 0
 
-    token_times = []
-    start = time.perf_counter()
-    first_token_time = None
+    for _ in range(runs):
+        params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
+        engine = LLMEngine(model, tokenizer)
+        engine.add_request(prompt, params)
 
-    step_count = 0
-    while engine.has_unfinished():
-        step_start = time.perf_counter()
-        outputs = engine.step()
-        step_end = time.perf_counter()
+        token_times = []
+        start = time.perf_counter()
+        first_token_time = None
 
-        step_count += 1
-        token_times.append((step_end - step_start) * 1000)
+        step_count = 0
+        while engine.has_unfinished():
+            step_start = time.perf_counter()
+            outputs = engine.step()
+            step_end = time.perf_counter()
 
-        if first_token_time is None and step_count == 1:
-            first_token_time = (step_end - start) * 1000
+            step_count += 1
+            token_times.append((step_end - step_start) * 1000)
 
-        if outputs:
-            break
+            if first_token_time is None and step_count == 1:
+                first_token_time = (step_end - start) * 1000
 
-    end = time.perf_counter()
+            if outputs:
+                break
 
-    ttft = first_token_time if first_token_time else 0
-    decode_times = token_times[1:] if len(token_times) > 1 else []
-    tpot = sum(decode_times) / len(decode_times) if decode_times else 0
-    e2e = (end - start) * 1000
+        end = time.perf_counter()
+
+        ttft = first_token_time if first_token_time else 0
+        decode_times = token_times[1:] if len(token_times) > 1 else []
+        tpot = sum(decode_times) / len(decode_times) if decode_times else 0
+        e2e = (end - start) * 1000
+
+        all_ttft.append(ttft)
+        all_tpot.append(tpot)
+        all_e2e.append(e2e)
+        num_tokens = len(token_times)
+
+    # Use median for stability
+    all_ttft.sort()
+    all_tpot.sort()
+    all_e2e.sort()
+    mid = len(all_ttft) // 2
 
     return LatencyResult(
-        ttft_ms=ttft,
-        tpot_ms=tpot,
-        e2e_ms=e2e,
-        num_tokens=len(token_times)
+        ttft_ms=all_ttft[mid],
+        tpot_ms=all_tpot[mid],
+        e2e_ms=all_e2e[mid],
+        num_tokens=num_tokens
     )
 
 
@@ -192,6 +209,32 @@ def run_latency_benchmark(model_path: Optional[str] = None):
 
     if config.dim < 512:
         print("\nNOTE: Small test model - use --model models/tinyllama for realistic benchmarks.")
+
+    # Context length scaling
+    print("\n" + "=" * 50)
+    print("Context Length Scaling")
+    print("=" * 50)
+
+    context_lengths = [32, 128, 256, 512] if model_path else [16, 64, 128, 256]
+
+    def generate_prompt(target_tokens: int) -> str:
+        if hasattr(tokenizer, 'vocab_size') and tokenizer.vocab_size == 256:
+            return "A" * target_tokens
+        else:
+            base = "The quick brown fox jumps over the lazy dog. "
+            return (base * (target_tokens * 4 // len(base) + 1))[:target_tokens * 4]
+
+    print("\n| Context | TTFT (ms) | TPOT (ms) | Decode tok/s |")
+    print("|---------|-----------|-----------|--------------|")
+
+    for ctx_len in context_lengths:
+        try:
+            prompt = generate_prompt(ctx_len)
+            result = measure_latency_detailed(model, tokenizer, prompt, max_tokens=10)
+            decode_tps = 1000 / result.tpot_ms if result.tpot_ms > 0 else 0
+            print(f"| {ctx_len:>7} | {result.ttft_ms:>9.0f} | {result.tpot_ms:>9.0f} | {decode_tps:>12.1f} |")
+        except Exception as e:
+            print(f"| {ctx_len:>7} | ERROR: {str(e)[:30]} |")
 
 
 if __name__ == "__main__":

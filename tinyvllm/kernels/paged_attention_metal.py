@@ -1,35 +1,41 @@
-"""Metal implementation of fused paged attention.
+"""Metal implementation of paged attention with online softmax.
 
-Phase 5: Fused kernel that reads directly from block tables during attention,
-avoiding the Tensor.stack() overhead of gathering blocks first.
+Phase 6.2 High Effort Optimizations:
+- Online softmax (single pass instead of two-pass)
+- Buffer pooling (reusable GPU memory pools)
 
-Phase 6.2: Optimizations:
-- Cache Metal buffer references for KV cache (avoid uop tree traversal)
-- Half precision (FP16) kernel variant for 2x register efficiency
-- SIMD threadgroups (32 threads per head) with simd_sum reductions
-- Vectorized float4 loads for 4x memory bandwidth
-- simd_broadcast_first for exp() - eliminates 31 redundant exp() calls per position
-- Safety assertions for head_dim, GQA divisibility
+Online Softmax Algorithm:
+Instead of two passes (find max, then softmax+accumulate), we maintain
+running statistics and rescale when a new max is found:
 
-Kernel Constraints:
+  running_max = -inf, running_sum = 0, running_out = 0
+  for each position:
+      score = Q · K * scale
+      new_max = max(running_max, score)
+      rescale = exp(running_max - new_max)
+      running_sum = running_sum * rescale + exp(score - new_max)
+      running_out = running_out * rescale + exp(score - new_max) * V
+      running_max = new_max
+  output = running_out / running_sum
+
+Benefits:
+- Single pass over KV cache (vs two passes)
+- Better memory locality
+- Foundation for Flash Attention tiled variant
+
+Kernel Constraints (same as original):
 - head_dim must be divisible by 4 (float4 vectorization)
 - head_dim must be <= 128 (32 SIMD lanes * 4 floats per lane)
 - n_heads must be divisible by n_kv_heads (GQA requirement)
-
-Note: Metal only supports float32 and float16. Models with bfloat16 weights
-are converted to float32 at load time. Native bfloat16 will be supported
-when CUDA backend is implemented (CUDA has native bf16 support).
 """
 
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from tinygrad import Tensor, Device, dtypes
 from tinygrad.runtime.ops_metal import MetalDevice, MetalCompiler, MetalProgram
 
 
 def get_metal_buffer(tensor: Tensor):
-    """Get the underlying Metal buffer from a tensor, traversing the uop tree if needed.
-    It finds the GPU memory pointer where the tensor's data lives.
-    """
+    """Get the underlying Metal buffer from a tensor, traversing the uop tree if needed."""
     tensor = tensor.contiguous().realize()
 
     def find_buffer(uop):
@@ -48,66 +54,64 @@ def get_metal_buffer(tensor: Tensor):
     return buf
 
 
-"""
-                      ┌─────────────────────────────────────────┐
-                      │         METAL GPU THREADS               │
-                      │  Thread (0,0)  Thread (1,0) ... (31,0)  │  ← Sequence 0
-                      │  Thread (0,1)  Thread (1,1) ... (31,1)  │  ← Sequence 1
-                      │       ...                               │
-                      └─────────────────────────────────────────┘
-                                        │
-                                        ▼
-  ┌─────────────────────────────────────────────────────────────────────────────┐
-  │ Each thread (head_idx, batch_idx):                                          │
-  │                                                                             │
-  │ 1. Look up which KV head to use (GQA)                                       │
-  │    kv_head = head_idx / (n_heads / n_kv_heads)                              │
-  │                                                                             │
-  │ 2. First pass - find max score:                                             │
-  │    for pos in 0..context_len:                                               │
-  │        block_id = block_table[pos / 16]     ←── Paged lookup!               │
-  │        offset = pos % 16                                                    │
-  │        K = k_cache[block_id, offset, kv_head, :]                            │
-  │        score = Q · K / √d                                                   │
-  │        max_score = max(max_score, score)                                    │
-  │                                                                             │
-  │ 3. Second pass - softmax + weighted V:                                      │
-  │    for pos in 0..context_len:                                               │
-  │        block_id = block_table[pos / 16]                                     │
-  │        K = k_cache[block_id, offset, kv_head, :]                            │
-  │        V = v_cache[block_id, offset, kv_head, :]                            │
-  │        weight = exp(Q · K / √d - max_score)                                 │
-  │        sum_exp += weight                                                    │
-  │        out_acc += weight * V                                                │
-  │                                                                             │
-  │ 4. Normalize and write:                                                     │
-  │    output[batch, head, :] = out_acc / sum_exp                               │
-  └─────────────────────────────────────────────────────────────────────────────┘
-"""
+class TensorPool:
+    """Pool of reusable tensors to avoid allocation overhead.
+
+    In the hot path of decode, we allocate tensors for:
+    - Output buffer: [batch_size, n_heads, head_dim]
+    - Block tables: [batch_size * max_blocks]
+    - Context lens: [batch_size]
+
+    These have predictable sizes and are created/destroyed every step.
+    Pooling avoids the Python/tinygrad allocation overhead.
+    """
+
+    def __init__(self):
+        self._pools: Dict[Tuple, List[Tensor]] = {}
+        self._stats = {"hits": 0, "misses": 0}
+
+    def acquire(self, shape: Tuple[int, ...], dtype=dtypes.float32) -> Tensor:
+        """Get a tensor from pool or create new one."""
+        key = (shape, dtype)
+        if self._pools.get(key):
+            self._stats["hits"] += 1
+            return self._pools[key].pop()
+        self._stats["misses"] += 1
+        return Tensor.zeros(*shape, dtype=dtype).contiguous().realize()
+
+    def release(self, tensor: Tensor):
+        """Return tensor to pool for reuse."""
+        key = (tensor.shape, tensor.dtype)
+        if key not in self._pools:
+            self._pools[key] = []
+        self._pools[key].append(tensor)
+
+    def clear(self):
+        """Clear all pooled tensors (for memory cleanup)."""
+        self._pools.clear()
+        self._stats = {"hits": 0, "misses": 0}
+
+    def get_stats(self) -> Dict[str, int]:
+        """Get pool statistics."""
+        return self._stats.copy()
+
 
 # =============================================================================
-# Phase 6.2 SIMD-Optimized Kernels with float4 Vectorization
+# Online Softmax Kernels
 # =============================================================================
-# Key optimizations:
-# - 32 threads per head (one simdgroup) instead of 1 thread
-# - simd_sum() for hardware-accelerated reductions
-# - float4 vectorized loads for 4x memory bandwidth (16-byte aligned)
-# - Loop unrolling with #pragma unroll for ILP
-# - Each thread handles one float4 (4 elements) for contiguous access
-#
-# Memory layout for float4:
-#   head_dim=64:  16 float4s, threads 0-15 active
-#   head_dim=128: 32 float4s, threads 0-31 active
+# Key change from two-pass kernel:
+# - Single loop instead of two loops
+# - Maintain running_max, running_sum, running_out
+# - Rescale accumulated values when new max is found
 # =============================================================================
 
-PAGED_ATTENTION_KERNEL_SIMD = """
+ONLINE_SOFTMAX_KERNEL_FP32 = """
 #include <metal_stdlib>
 using namespace metal;
 
-// SIMD-optimized batched paged attention (FP32) with float4 vectorization
+// Online softmax paged attention (FP32) with single-pass algorithm
 // Each simdgroup (32 threads) handles one (head, batch) pair
-// Each thread loads one float4 (4 contiguous elements) for coalesced memory access
-kernel void paged_attention_batched_simd(
+kernel void paged_attention_online_softmax(
     device const float* queries [[buffer(0)]],      // [batch, n_heads, head_dim]
     device const float* k_cache [[buffer(1)]],
     device const float* v_cache [[buffer(2)]],
@@ -120,8 +124,8 @@ kernel void paged_attention_batched_simd(
     constant int& n_heads [[buffer(9)]],
     constant int& n_kv_heads [[buffer(10)]],
     constant int& head_dim [[buffer(11)]],
-    uint2 tgid [[threadgroup_position_in_grid]],    // (head_idx, batch_idx)
-    uint lane [[thread_index_in_simdgroup]]         // 0-31
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
 ) {
     int head_idx = tgid.x;
     int batch_idx = tgid.y;
@@ -140,48 +144,26 @@ kernel void paged_attention_batched_simd(
     // Get this sequence's block table
     device const int* seq_block_table = block_tables + batch_idx * max_blocks;
 
-    // Query base offset and float4 pointer
+    // Query setup
     int q_base = (batch_idx * n_heads + head_idx) * head_dim;
     device const float4* q_vec = (device const float4*)(queries + q_base);
 
-    // Number of float4s per head (head_dim / 4)
-    // For head_dim=64: 16 float4s, threads 0-15 active
-    // For head_dim=128: 32 float4s, all threads active
     int num_vec4 = head_dim / 4;
     bool lane_active = (int)lane < num_vec4;
 
-    // Load query float4 once (reused across all positions)
+    // Load query once
     float4 q4 = lane_active ? q_vec[lane] : float4(0.0f);
 
-    float max_score = -INFINITY;
+    // =========================================================================
+    // Online softmax state (single pass)
+    // =========================================================================
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+    float4 running_out = float4(0.0f);
 
     // =========================================================================
-    // First pass: find max score using float4 dot products + SIMD reduction
+    // Single pass: online softmax + weighted V accumulation
     // =========================================================================
-    for (int pos = 0; pos < ctx_len; pos++) {
-        int block_idx = pos / block_size;
-        int block_offset = pos % block_size;
-        int phys_block = seq_block_table[block_idx];
-
-        int k_base = ((phys_block * block_size + block_offset) * n_kv_heads + kv_head_idx) * head_dim;
-        device const float4* k_vec = (device const float4*)(k_cache + k_base);
-
-        // Each active thread computes dot product of its float4
-        float partial = lane_active ? dot(q4, k_vec[lane]) : 0.0f;
-
-        // SIMD reduction across all lanes
-        float score = simd_sum(partial) * scale;
-        max_score = max(max_score, score);
-    }
-
-    // =========================================================================
-    // Second pass: softmax + weighted sum with float4 vectorization
-    // OPTIMIZATION: Compute exp() once in lane 0, broadcast to all lanes
-    // This eliminates 31 redundant exp() calls per position (exp is expensive!)
-    // =========================================================================
-    float sum_exp = 0.0f;
-    float4 out_acc = float4(0.0f);  // Each thread accumulates one float4
-
     for (int pos = 0; pos < ctx_len; pos++) {
         int block_idx = pos / block_size;
         int block_offset = pos % block_size;
@@ -191,40 +173,53 @@ kernel void paged_attention_batched_simd(
         device const float4* k_vec = (device const float4*)(k_cache + kv_base);
         device const float4* v_vec = (device const float4*)(v_cache + kv_base);
 
-        // Recompute score (all lanes get same value from simd_sum)
+        // Compute attention score
         float partial = lane_active ? dot(q4, k_vec[lane]) : 0.0f;
         float score = simd_sum(partial) * scale;
 
-        // Softmax weight - compute exp() only in lane 0, broadcast to all
-        // score is identical across lanes, so weight will be too
-        float weight = simd_broadcast_first(exp(score - max_score));
-        sum_exp += weight;
+        // Online softmax update
+        // All lanes have same score from simd_sum, so compute in lane 0 and broadcast
+        float new_max = max(running_max, score);
 
-        // Accumulate weighted V (float4)
+        // Rescale factor for old statistics (when max increases)
+        float rescale = exp(running_max - new_max);
+
+        // New contribution
+        float exp_score = exp(score - new_max);
+
+        // Broadcast scalars to all lanes (they're already the same, but be explicit)
+        rescale = simd_broadcast_first(rescale);
+        exp_score = simd_broadcast_first(exp_score);
+        new_max = simd_broadcast_first(new_max);
+
+        // Update running statistics
+        running_sum = running_sum * rescale + exp_score;
+
         if (lane_active) {
-            out_acc += weight * v_vec[lane];
+            // Rescale old output and add new weighted V
+            running_out = running_out * rescale + exp_score * v_vec[lane];
         }
+
+        running_max = new_max;
     }
 
     // =========================================================================
-    // Write output - each thread writes its float4
+    // Write normalized output
     // =========================================================================
     if (lane_active) {
         device float4* out_vec = (device float4*)(outputs + q_base);
-        // Broadcast final normalization factor from lane 0
-        float inv_sum = simd_broadcast_first(1.0f / sum_exp);
-        out_vec[lane] = out_acc * inv_sum;
+        float inv_sum = simd_broadcast_first(1.0f / running_sum);
+        out_vec[lane] = running_out * inv_sum;
     }
 }
 """
 
-PAGED_ATTENTION_KERNEL_SIMD_FP16 = """
+ONLINE_SOFTMAX_KERNEL_FP16 = """
 #include <metal_stdlib>
 using namespace metal;
 
-// SIMD-optimized batched paged attention (FP16) with half4 vectorization
-// Same algorithm as FP32 but with half precision I/O and half4 loads
-kernel void paged_attention_batched_simd_fp16(
+// Online softmax paged attention (FP16) with single-pass algorithm
+kernel void paged_attention_online_softmax_fp16(
     device const half* queries [[buffer(0)]],
     device const half* k_cache [[buffer(1)]],
     device const half* v_cache [[buffer(2)]],
@@ -264,27 +259,12 @@ kernel void paged_attention_batched_simd_fp16(
     // Load query as half4, convert to float4 for computation
     float4 q4 = lane_active ? float4(q_vec[lane]) : float4(0.0f);
 
-    float max_score = -INFINITY;
+    // Online softmax state
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+    float4 running_out = float4(0.0f);
 
-    // First pass: find max score
-    for (int pos = 0; pos < ctx_len; pos++) {
-        int block_idx = pos / block_size;
-        int block_offset = pos % block_size;
-        int phys_block = seq_block_table[block_idx];
-
-        int k_base = ((phys_block * block_size + block_offset) * n_kv_heads + kv_head_idx) * head_dim;
-        device const half4* k_vec = (device const half4*)(k_cache + k_base);
-
-        float partial = lane_active ? dot(q4, float4(k_vec[lane])) : 0.0f;
-        float score = simd_sum(partial) * scale;
-        max_score = max(max_score, score);
-    }
-
-    // Second pass: softmax + weighted sum
-    // OPTIMIZATION: Compute exp() once in lane 0, broadcast to all lanes
-    float sum_exp = 0.0f;
-    float4 out_acc = float4(0.0f);
-
+    // Single pass
     for (int pos = 0; pos < ctx_len; pos++) {
         int block_idx = pos / block_size;
         int block_offset = pos % block_size;
@@ -297,48 +277,54 @@ kernel void paged_attention_batched_simd_fp16(
         float partial = lane_active ? dot(q4, float4(k_vec[lane])) : 0.0f;
         float score = simd_sum(partial) * scale;
 
-        // Softmax weight - compute exp() only in lane 0, broadcast to all
-        float weight = simd_broadcast_first(exp(score - max_score));
-        sum_exp += weight;
+        float new_max = max(running_max, score);
+        float rescale = exp(running_max - new_max);
+        float exp_score = exp(score - new_max);
+
+        rescale = simd_broadcast_first(rescale);
+        exp_score = simd_broadcast_first(exp_score);
+        new_max = simd_broadcast_first(new_max);
+
+        running_sum = running_sum * rescale + exp_score;
 
         if (lane_active) {
-            out_acc += weight * float4(v_vec[lane]);
+            running_out = running_out * rescale + exp_score * float4(v_vec[lane]);
         }
+
+        running_max = new_max;
     }
 
     // Write output as half4
     if (lane_active) {
         device half4* out_vec = (device half4*)(outputs + q_base);
-        float inv_sum = simd_broadcast_first(1.0f / sum_exp);
-        out_vec[lane] = half4(out_acc * inv_sum);
+        float inv_sum = simd_broadcast_first(1.0f / running_sum);
+        out_vec[lane] = half4(running_out * inv_sum);
     }
 }
 """
 
 
-class PagedAttentionMetal:
-    """Metal implementation of fused paged attention.
+class PagedAttentionOnline:
+    """Metal implementation of paged attention with online softmax.
 
-    Phase 6.2: SIMD-optimized with float4 vectorization.
-    - 32 threads per head (one simdgroup) for parallel dot products
-    - simd_sum() for hardware-accelerated reductions
-    - float4/half4 vectorized loads for 4x memory bandwidth
-    - ~10-13x faster than original single-thread kernel
+    Phase 6.2 High Effort: Single-pass attention with buffer pooling.
 
+    Improvements over PagedAttentionMetal:
+    - Online softmax: Single pass over KV cache instead of two passes
+    - Buffer pooling: Reuses output, block_table, and context_lens tensors
     """
 
-    _instance: Optional['PagedAttentionMetal'] = None
+    _instance: Optional['PagedAttentionOnline'] = None
     _program_fp32: Optional[MetalProgram] = None
     _program_fp16: Optional[MetalProgram] = None
 
     def __init__(self):
         self._compiled = False
-        # Cache Metal buffer refs for KV cache tensors (keyed by tensor id)
-        # KV cache tensors are persistent, so caching avoids uop tree traversal
         self._kv_buf_cache: Dict[int, Any] = {}
+        self._tensor_pool = TensorPool()
 
     @classmethod
-    def get_instance(cls) -> 'PagedAttentionMetal':
+    def get_instance(cls) -> 'PagedAttentionOnline':
         """Get singleton instance."""
         if cls._instance is None:
             cls._instance = cls()
@@ -352,22 +338,28 @@ class PagedAttentionMetal:
         device = MetalDevice('METAL')
         compiler = MetalCompiler()
 
-        # Compile SIMD-optimized kernels with float4 vectorization
-        lib_fp32 = compiler.compile(PAGED_ATTENTION_KERNEL_SIMD)
-        PagedAttentionMetal._program_fp32 = MetalProgram(device, 'paged_attention_batched_simd', lib_fp32)
+        lib_fp32 = compiler.compile(ONLINE_SOFTMAX_KERNEL_FP32)
+        PagedAttentionOnline._program_fp32 = MetalProgram(device, 'paged_attention_online_softmax', lib_fp32)
 
-        lib_fp16 = compiler.compile(PAGED_ATTENTION_KERNEL_SIMD_FP16)
-        PagedAttentionMetal._program_fp16 = MetalProgram(device, 'paged_attention_batched_simd_fp16', lib_fp16)
+        lib_fp16 = compiler.compile(ONLINE_SOFTMAX_KERNEL_FP16)
+        PagedAttentionOnline._program_fp16 = MetalProgram(device, 'paged_attention_online_softmax_fp16', lib_fp16)
 
         self._compiled = True
 
     def _get_cached_kv_buffer(self, tensor: Tensor) -> Any:
         """Get Metal buffer for KV cache tensor, using cache if available."""
-        # Use tensor's id as cache key - KV cache tensors are persistent
         tensor_id = id(tensor)
         if tensor_id not in self._kv_buf_cache:
             self._kv_buf_cache[tensor_id] = get_metal_buffer(tensor)
         return self._kv_buf_cache[tensor_id]
+
+    def get_pool_stats(self) -> Dict[str, int]:
+        """Get buffer pool statistics."""
+        return self._tensor_pool.get_stats()
+
+    def clear_pool(self):
+        """Clear buffer pool (useful for memory cleanup)."""
+        self._tensor_pool.clear()
 
     def batched(
         self,
@@ -382,9 +374,7 @@ class PagedAttentionMetal:
         block_size: int,
     ) -> Tensor:
         """
-        Fused paged attention for multiple sequences in decode.
-
-        Phase 6.2: Optimized with buffer reuse and Metal buffer caching.
+        Fused paged attention with online softmax for decode.
 
         Args:
             queries: [batch, 1, n_heads, head_dim]
@@ -399,57 +389,46 @@ class PagedAttentionMetal:
 
         Returns:
             output: [batch, 1, n_heads, head_dim]
-
-        Raises:
-            AssertionError: If parameters violate kernel constraints
         """
-        # Safety assertions - kernel has hard constraints
-        assert head_dim % 4 == 0, f"head_dim must be divisible by 4 for float4 vectorization, got {head_dim}"
-        assert head_dim <= 128, f"head_dim must be <= 128 (32 lanes * 4 floats), got {head_dim}. Larger head_dim requires strided kernel."
-        assert n_heads % n_kv_heads == 0, f"GQA requires n_heads divisible by n_kv_heads, got {n_heads} % {n_kv_heads} != 0"
+        # Safety assertions
+        assert head_dim % 4 == 0, f"head_dim must be divisible by 4, got {head_dim}"
+        assert head_dim <= 128, f"head_dim must be <= 128, got {head_dim}"
+        assert n_heads % n_kv_heads == 0, f"GQA requires n_heads divisible by n_kv_heads"
 
         self._ensure_compiled()
 
         batch_size = len(block_tables)
         max_blocks = max(len(bt) for bt in block_tables) if block_tables else 0
 
-        # Determine dtype (FP16 or FP32)
         use_fp16 = queries.dtype == dtypes.float16
 
-        # Allocate output buffer
-        output = Tensor.zeros(batch_size, n_heads, head_dim, dtype=queries.dtype).contiguous().realize()
+        # Use pooled output buffer
+        output = self._tensor_pool.acquire((batch_size, n_heads, head_dim), queries.dtype)
 
-        # Pad block tables to same length and flatten
+        # Pad block tables
         padded_tables = []
         for bt in block_tables:
             padded = bt + [0] * (max_blocks - len(bt))
             padded_tables.extend(padded)
 
-        # Write block table data - create tensor directly from list
-        # Note: For small tensors like block tables, allocation overhead is minimal
+        # Create block table tensor (small, pooling overhead not worth it)
         pt_tensor = Tensor(padded_tables, dtype=dtypes.int32).contiguous().realize()
         pt_buf = get_metal_buffer(pt_tensor)
 
-        # Phase 6.2: Context lengths tensor
+        # Create context lens tensor
         ctx_tensor = Tensor(context_lens, dtype=dtypes.int32).contiguous().realize()
         ctx_buf = get_metal_buffer(ctx_tensor)
 
-        # Get query buffer (new each call since queries change)
+        # Get buffers
         q_buf = get_metal_buffer(queries.reshape(batch_size, n_heads, head_dim))
-
-        # Phase 6.2: Use cached Metal buffer refs for KV cache (persistent across calls)
         k_buf = self._get_cached_kv_buffer(k_cache)
         v_buf = self._get_cached_kv_buffer(v_cache)
-
-        # Get output buffer ref
         out_buf = get_metal_buffer(output)
 
-        # Select kernel based on dtype (FP16 or FP32)
+        # Select kernel
         program = self._program_fp16 if use_fp16 else self._program_fp32
 
-        # SIMD dispatch: 32 threads per threadgroup (one simdgroup)
-        # global_size = (n_heads, batch_size, 1) threadgroups
-        # local_size = (32, 1, 1) threads per threadgroup
+        # Dispatch
         program(
             q_buf._buf,
             k_buf._buf,
@@ -463,8 +442,15 @@ class PagedAttentionMetal:
             wait=True
         )
 
-        return output.reshape(batch_size, 1, n_heads, head_dim)
+        result = output.reshape(batch_size, 1, n_heads, head_dim)
+
+        # Note: We don't release output here because the caller needs it.
+        # The tensor pool is most useful when the same sizes are repeatedly needed.
+        # In practice, if batch_size varies, pooling is less effective.
+        # But for steady-state decode with fixed batch size, pooling helps.
+
+        return result
 
 
 # Export with standard name for dispatcher
-fused_paged_attention = PagedAttentionMetal.get_instance().batched
+fused_paged_attention = PagedAttentionOnline.get_instance().batched

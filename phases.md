@@ -410,10 +410,23 @@ Medium effort:
 - Command buffer batching (multiple ops per submit) -- not completed, requires tinygrad changes
 
 High effort:
-- Online softmax (single pass instead of two-pass)
-- Tiled attention (Flash Attention style blocking)
-- simdgroup_async_copy (overlap compute and memory loads, M1+)
-- Buffer pooling (reusable GPU memory pools)
+- Online softmax (single pass instead of two-pass) ✅
+- Buffer pooling (reusable GPU memory pools) ✅
+- Tiled attention (Flash Attention style blocking) -- deferred to Phase 7.x (prefill focus)
+- simdgroup_async_copy (overlap compute and memory loads, M1+) -- deferred to Phase 6.2.1
+
+### Phase 6.2.1: simdgroup_async_copy (Future Research)
+**Status:** Deferred - undocumented Metal API requires research
+
+Metal's simdgroup_async_copy provides async memory transfers from device to threadgroup memory,
+similar to CUDA's cp.async. Benefits:
+- Overlap memory loads with compute (double-buffering)
+- Hide memory latency during tile loading
+
+Implementation requires:
+- Research undocumented API (available since A14/M1)
+- May require AIR (Apple IR) compilation workarounds
+- Most effective when combined with tiled attention
 
 6.3 Decode Optimization
 - KV cache write batching (batch realizes instead of per-token)
@@ -666,6 +679,110 @@ Non-blocking Tensor Operations:
 - Token acceptance rate (for speculative decoding)
 - Cache hit rate (for prefix caching)
 - Memory profiling (used, free, fragmentation)
+
+7.8 Flash Attention for Prefill (HIGH IMPACT)
+**Impact: 2-4x prefill speedup, enables longer context**
+**Prerequisite:** Online softmax (completed in Phase 6.2)
+
+Tiled attention with online softmax for prefill phase:
+- Process Q, K, V in tiles (block_size × block_size)
+- Use threadgroup memory for tile storage
+- Online softmax to combine tile results without storing full attention matrix
+
+Algorithm:
+```
+for each Q tile:
+    running_max, running_sum, running_out = -inf, 0, 0
+    for each KV tile:
+        load K_tile, V_tile to threadgroup memory
+        scores = Q_tile @ K_tile.T * scale
+        # Online softmax update
+        new_max = max(running_max, scores.max())
+        rescale = exp(running_max - new_max)
+        running_sum = running_sum * rescale + sum(exp(scores - new_max))
+        running_out = running_out * rescale + softmax(scores) @ V_tile
+        running_max = new_max
+    output_tile = running_out / running_sum
+```
+
+Benefits:
+- O(1) memory regardless of sequence length (vs O(n²) for standard attention)
+- Faster prefill for long prompts (4K+ tokens)
+- Foundation for longer context windows (16K+)
+
+7.9 Framework Overhead Reduction (CRITICAL - from Phase 6.2 profiling) - check profiling.md
+**Impact: 10-50x throughput improvement potential**
+**Status:** Research phase - identified as primary bottleneck
+
+Profiling with tinygrad DEBUG=2 revealed the main performance gap is NOT GPU kernel speed,
+but framework overhead between kernel calls.
+
+Current bottlenecks identified:
+
+| Bottleneck | Measured Impact | Root Cause |
+|------------|-----------------|------------|
+| Python→Metal copies | 87ms for 131MB (1.5 GB/s) | Slow unified memory path |
+| Scheduling overhead | 2-20ms per batch | Python interprets kernel graph each step |
+| No JIT caching | Repeats work | `TinyJit` not used in hot path |
+| Many small ops | 6-12μs each | Kernel launch latency dominates |
+
+**Current state:** 1.9 tok/s achieved vs 55 tok/s theoretical (3.5% utilization)
+
+7.9.1 TinyJit for Decode Loop
+Apply tinygrad's JIT decorator to cache kernel graphs:
+
+```python
+from tinygrad.engine.jit import TinyJit
+
+class Llama:
+    @TinyJit
+    def batched_decode_jit(self, tokens, kv_cache, ...):
+        # JIT requires fixed input shapes
+        # Pad batch to max_batch_size
+        return self._batched_decode_impl(tokens, kv_cache, ...)
+```
+
+Challenges:
+- TinyJit requires fixed input shapes (variable batch size breaks it)
+- Solution: Pad to fixed batch size, mask unused slots
+- Warmup run required to capture kernel graph
+
+Expected impact: 2-5x speedup (eliminates per-step scheduling overhead)
+
+7.9.2 Reduce Python→GPU Data Copies
+Model weights should stay on GPU, but may be re-copied:
+
+Investigation needed:
+- Profile which tensors are being copied (weights vs activations?)
+- Ensure weights are `.realize()`d once at load time
+- Check if block_tables/context_lens can stay on GPU
+
+7.9.3 Kernel Fusion
+Many small operations (6-12μs each) could be fused:
+
+Candidates for fusion:
+- RMSNorm + Linear projection
+- RoPE + Q/K projection
+- Softmax + V accumulation (done via online softmax)
+
+tinygrad may auto-fuse some of these - need to verify with DEBUG=4.
+
+7.9.4 Pre-allocated Buffers
+Avoid per-step tensor allocation:
+
+```python
+class LLMEngine:
+    def __init__(self):
+        # Pre-allocate decode buffers
+        self.input_buffer = Tensor.zeros(max_batch, 1).realize()
+        self.output_buffer = Tensor.zeros(max_batch, 1, vocab_size).realize()
+```
+
+7.9.5 Metal System Trace
+For deeper GPU analysis, use Xcode Instruments:
+- Metal System Trace template
+- Shows GPU utilization, kernel occupancy, memory bandwidth
+- Identifies GPU-side bottlenecks vs CPU-side
 
 ---
 

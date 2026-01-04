@@ -74,17 +74,24 @@ def create_model(dim=64, n_layers=4, n_heads=4, vocab_size=256):
     return Llama(config), config
 
 
-def bench_single_request(model, tokenizer, prompt: str, max_tokens: int) -> BenchmarkResult:
-    """Benchmark single request generation."""
-    params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
-    engine = LLMEngine(model, tokenizer)
-    engine.add_request(prompt, params)
+def bench_single_request(model, tokenizer, prompt: str, max_tokens: int, runs: int = 3) -> BenchmarkResult:
+    """Benchmark single request generation with median of multiple runs."""
+    elapsed_times = []
+    total_tokens = 0
 
-    start = time.perf_counter()
-    outputs = list(engine.run())
-    elapsed = time.perf_counter() - start
+    for _ in range(runs):
+        params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
+        engine = LLMEngine(model, tokenizer)
+        engine.add_request(prompt, params)
 
-    total_tokens = sum(len(o.tokens) for o in outputs)
+        start = time.perf_counter()
+        outputs = list(engine.run())
+        elapsed_times.append(time.perf_counter() - start)
+        total_tokens = sum(len(o.tokens) for o in outputs)
+
+    # Use median for stability
+    elapsed_times.sort()
+    elapsed = elapsed_times[len(elapsed_times) // 2]
 
     return BenchmarkResult(
         name="single_request",
@@ -156,6 +163,47 @@ def print_result(result: BenchmarkResult):
     print(f"  Requests/sec:{result.requests_per_sec:.2f}")
     if result.utilization_pct is not None:
         print(f"  Utilization: {result.utilization_pct:.1f}% of theoretical max")
+
+
+def generate_long_prompt(tokenizer, target_tokens: int) -> str:
+    """Generate a prompt that will be approximately target_tokens long."""
+    # For mock tokenizer, each char is roughly 1 token
+    # For real tokenizers, we need more text per token
+    if hasattr(tokenizer, 'vocab_size') and tokenizer.vocab_size == 100:
+        # Mock tokenizer: 1 char ≈ 1 token
+        return "A" * target_tokens
+    else:
+        # Real tokenizer: roughly 4 chars per token for English
+        base_text = "The quick brown fox jumps over the lazy dog. "
+        repeats = (target_tokens * 4) // len(base_text) + 1
+        return (base_text * repeats)[:target_tokens * 4]
+
+
+def bench_with_context_length(
+    model, tokenizer, context_len: int, max_tokens: int, num_requests: int = 1
+) -> BenchmarkResult:
+    """Benchmark with specific context length (prompt size)."""
+    prompt = generate_long_prompt(tokenizer, context_len)
+    params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
+    engine = LLMEngine(model, tokenizer)
+
+    for _ in range(num_requests):
+        engine.add_request(prompt, params)
+
+    start = time.perf_counter()
+    outputs = list(engine.run())
+    elapsed = time.perf_counter() - start
+
+    total_tokens = sum(len(o.tokens) for o in outputs)
+
+    return BenchmarkResult(
+        name=f"ctx_{context_len}_x{num_requests}",
+        num_requests=num_requests,
+        total_tokens=total_tokens,
+        elapsed_sec=elapsed,
+        tokens_per_sec=total_tokens / elapsed if elapsed > 0 else 0,
+        requests_per_sec=num_requests / elapsed if elapsed > 0 else 0,
+    )
 
 
 def run_benchmarks(model_path: Optional[str] = None):
@@ -304,6 +352,24 @@ def run_benchmarks(model_path: Optional[str] = None):
         print("\nNOTE: Small test model (dim={}, {:.1f} MB) - framework overhead dominates.".format(
             config.dim, theoretical.model_bytes / 1e6))
         print("      Use --model models/tinyllama for realistic benchmarks.")
+
+    # Context length scaling benchmarks
+    print("\n" + "=" * 50)
+    print("Context Length Scaling")
+    print("=" * 50)
+
+    context_lengths = [32, 128, 256, 512] if model_path else [32, 64, 128, 256]
+
+    print("\n| Context | Tokens | Time (s) | Tok/sec | ms/token |")
+    print("|---------|--------|----------|---------|----------|")
+
+    for ctx_len in context_lengths:
+        try:
+            r = bench_with_context_length(model, tokenizer, ctx_len, max_tokens=10, num_requests=1)
+            ms_per_token = (r.elapsed_sec * 1000) / r.total_tokens if r.total_tokens > 0 else 0
+            print(f"| {ctx_len:>7} | {r.total_tokens:>6} | {r.elapsed_sec:>8.2f} | {r.tokens_per_sec:>7.1f} | {ms_per_token:>8.1f} |")
+        except Exception as e:
+            print(f"| {ctx_len:>7} | ERROR: {str(e)[:40]} |")
 
     return results
 

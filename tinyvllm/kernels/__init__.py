@@ -1,4 +1,7 @@
-"""Custom kernels for Phase 5 - backend selected by device name convention."""
+"""Custom kernels for Phase 5/6 - backend selected by device name convention.
+
+Phase 6.2: Uses online softmax kernel with buffer pooling for Metal.
+"""
 
 import importlib
 from tinygrad import Device
