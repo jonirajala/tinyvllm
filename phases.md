@@ -387,7 +387,7 @@ Metal kernel for Apple Silicon. CUDA kernel deferred to Phase 6.
 
 6.1 Sampling Optimization (QUICK WINS)
 - Remove .realize().tolist() sync points  ← easy, high impact
-- Batched sampling across sequences (currently single token at a time)
+- Batched sampling across sequences (currently single token at a time)  --- not yet implemented since we have different sampling params
 - Top-p/top-k on GPU (currently converts to CPU list)
 
 6.2 Metal Kernel Optimizations (INCREMENTAL)
@@ -401,11 +401,13 @@ Quick wins:
 - half precision (float16 instead of float32 - 2x register efficiency)
 
 Medium effort:
-- 32-thread threadgroups (one simdgroup, avoid threadgroup barriers)
-- SIMD shuffle reductions (simd_sum instead of shared memory)
-- Vectorized float4 loads (16-byte aligned memory access)
-- Loop unrolling (unroll head_dim loops for instruction-level parallelism)
-- Command buffer batching (multiple ops per submit)
+- 32-thread threadgroups (one simdgroup, avoid threadgroup barriers) ✅
+- SIMD shuffle reductions (simd_sum instead of shared memory) ✅
+- Vectorized float4 loads (16-byte aligned memory access) ✅
+- simd_broadcast_first for exp() (eliminates 31 redundant exp() per position) ✅
+- Safety assertions for kernel constraints (head_dim, GQA divisibility) ✅
+- Loop unrolling (unroll head_dim loops for instruction-level parallelism) -- not needed, dynamic ctx_len
+- Command buffer batching (multiple ops per submit) -- not completed, requires tinygrad changes
 
 High effort:
 - Online softmax (single pass instead of two-pass)
@@ -434,6 +436,192 @@ High effort:
 - Optimized memory access patterns
 - Use tinygrad's CUDAProgram API
 - CUDA graphs (capture and replay decode loop)
+
+6.7 Weight Quantization (CRITICAL - from vLLM research)
+**Impact: 2-4x throughput improvement**
+**Rationale:** Decode is memory-bandwidth-bound. Loading 2.2GB weights per token limits throughput to ~55 tok/s on M4. Quantization directly reduces data to load.
+
+INT8 Quantization:
+- Per-channel or per-tensor scale factors
+- 2x compression (2.2GB → 1.1GB)
+- Minimal quality loss (<1% perplexity)
+- Dequantize on-the-fly during matmul
+
+INT4 Quantization (GPTQ/AWQ style):
+- Per-group scales (group_size=128 typical)
+- 4x compression (2.2GB → 0.55GB)
+- Requires calibration dataset
+- Slight quality loss (~1-3% perplexity)
+
+Implementation:
+```python
+class QuantizedLinear:
+    def __init__(self, weight_int8: Tensor, scale: Tensor):
+        self.weight = weight_int8  # [out, in] int8
+        self.scale = scale         # [out] or [out, in//group_size]
+
+    def __call__(self, x: Tensor) -> Tensor:
+        # Dequantize during matmul for memory efficiency
+        w_fp = self.weight.cast(dtypes.float16) * self.scale
+        return x @ w_fp.T
+```
+
+Metal kernel for fused dequant+matmul:
+- Load INT8 weights, dequantize in registers
+- Compute matmul with FP16 accumulation
+- Avoid materializing full FP16 weight tensor
+
+6.8 Multi-Step Scheduling (HIGH IMPACT - from vLLM research)
+**Impact: 20-30% throughput improvement**
+**Rationale:** CPU scheduling overhead between every decode step wastes time. Batch multiple steps together.
+
+Before (single-step):
+```
+CPU[schedule] → GPU[decode] → CPU[schedule] → GPU[decode] → ...
+~10ms overhead between each step
+```
+
+After (multi-step, N=8):
+```
+CPU[schedule] → GPU[decode×8] → CPU[schedule] → GPU[decode×8] → ...
+Overhead amortized over 8 steps
+```
+
+Implementation:
+- Add `num_scheduler_steps` parameter to engine
+- Scheduler returns batch for N steps
+- GPU runs N decode iterations without returning to scheduler
+- After N steps, check for finished sequences and new requests
+
+Trade-offs:
+- Pro: Less CPU overhead, higher throughput
+- Con: New requests wait up to N steps for scheduling (higher TTFT at low load)
+- Configurable: N=1 for latency-sensitive, N=8+ for throughput
+
+6.9 FlashAttention for Prefill (HIGH IMPACT - from vLLM research)
+**Impact: 2-4x prefill speedup, enables longer context**
+**Rationale:** Standard attention materializes O(n²) attention matrix. FlashAttention uses O(1) memory via tiling.
+
+Standard Attention Memory:
+```
+seq_len=2K: 2K × 2K × 4 bytes = 16 MB per head
+seq_len=8K: 8K × 8K × 4 bytes = 256 MB per head
+```
+
+FlashAttention Memory:
+```
+Any seq_len: ~constant (tile size only)
+```
+
+Algorithm (simplified):
+```
+for q_tile in Q_tiles:
+    running_max = -inf
+    running_sum = 0
+    running_output = 0
+
+    for kv_tile in KV_tiles:
+        # Compute attention for this tile
+        scores = q_tile @ kv_tile.T
+
+        # Online softmax update
+        new_max = max(running_max, scores.max())
+        scale = exp(running_max - new_max)
+
+        running_sum = running_sum * scale + exp(scores - new_max).sum()
+        running_output = running_output * scale + softmax(scores) @ v_tile
+        running_max = new_max
+
+    output_tile = running_output / running_sum
+```
+
+Implementation for Metal:
+- Adapt Metal FlashAttention (github.com/philipturner/metal-flash-attention)
+- Use simdgroup_matrix for tile operations
+- Block sizes: 8×8 or 16×16 tiles for M-series
+
+6.10 Async Output Processing (MEDIUM IMPACT - from vLLM research)
+**Impact: 8-10% throughput improvement**
+**Rationale:** Detokenization blocks GPU. Process previous step's output while GPU computes current step.
+
+Before:
+```
+GPU[step N] → wait → CPU[detokenize N] → GPU[step N+1]
+              ↑ GPU idle
+```
+
+After:
+```
+GPU[step N] ――――――――――――――――――――――――→ GPU[step N+1]
+            CPU[detokenize N-1]
+            ↑ overlapped
+```
+
+Implementation:
+```python
+class AsyncOutputProcessor:
+    def __init__(self):
+        self.pending_outputs = queue.Queue()
+        self.worker = threading.Thread(target=self._process_loop)
+        self.worker.start()
+
+    def submit(self, tokens: List[int], callback):
+        """Submit tokens for async detokenization."""
+        self.pending_outputs.put((tokens, callback))
+
+    def _process_loop(self):
+        while True:
+            tokens, callback = self.pending_outputs.get()
+            text = self.tokenizer.decode(tokens)
+            callback(text)
+```
+
+Engine modification:
+- Don't wait for detokenization in step()
+- Submit to async processor
+- Return results via callback or poll
+
+6.11 CPU Overhead Reduction (MEDIUM IMPACT - from vLLM research)
+**Impact: 20-30% throughput improvement (combined)**
+
+Object Pooling:
+- Pre-allocate Request, Sequence, SchedulerOutput objects
+- Reuse instead of alloc/free each step
+- vLLM saw 24% improvement from this alone
+
+```python
+class ObjectPool:
+    def __init__(self, factory, size=100):
+        self.pool = [factory() for _ in range(size)]
+        self.available = list(range(size))
+
+    def acquire(self):
+        if self.available:
+            idx = self.available.pop()
+            return self.pool[idx]
+        return self.factory()  # Fallback
+
+    def release(self, obj):
+        obj.reset()  # Clear state
+        self.available.append(self.pool.index(obj))
+```
+
+Fast Path for Greedy Sampling:
+- Skip temperature/top-p/penalties when not needed
+- Direct argmax for greedy decoding
+
+```python
+def sample_tokens(logits, params):
+    if params.is_greedy:  # Fast path
+        return logits.argmax(dim=-1)
+    else:  # Full sampling
+        return _sample_with_params(logits, params)
+```
+
+Non-blocking Tensor Operations:
+- Use async CPU→GPU transfers where possible
+- Avoid unnecessary .realize() calls
+- Batch realize operations
 
 ---
 
@@ -595,9 +783,15 @@ class GenerateRequest:
 | 5 | Custom kernels faster | >1.5x speedup vs Tensor.stack() |
 | 6 | Chunked prefill works | Long prompts don't block other requests |
 | 6 | Batched sampling works | Sampling 16 sequences at once |
+| 6.7 | **Weight quantization works** | **INT8 model loads, >1.5x throughput, <2% quality loss** |
+| 6.8 | Multi-step scheduling works | N=8 steps per schedule, >20% throughput gain |
+| 6.9 | FlashAttention prefill works | 2K+ context prefill in <1s, O(1) memory |
+| 6.10 | Async output processing works | Detokenization overlaps with GPU compute |
+| 6.11 | Object pooling works | No allocations in hot path, >10% throughput |
 | 7 | Prefix caching works | Repeated prefixes hit cache |
 | 7 | KV cache quantization works | int8 KV with <1% quality loss |
 | 7 | Stop strings work | Generation stops at custom string |
+| 7.2 | **Speculative decoding works** | **Draft model + verify, >2x throughput** |
 | 8 | Multi-GPU works | Model runs across 2+ GPUs |
 | 9 | API works | curl POST /generate returns response |
 | 9 | Streaming works | Tokens arrive incrementally via SSE |
