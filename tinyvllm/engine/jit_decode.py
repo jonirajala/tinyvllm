@@ -187,6 +187,12 @@ class JitDecoder:
                     k_realized[i, 0], v_realized[i, 0]
                 )
 
+        # Realize KV cache after all writes (single sync instead of per-write)
+        for layer_idx in range(self.n_layers):
+            k_cache, v_cache = self.kv_cache.get_cache_tensors(layer_idx)
+            k_cache.realize()
+            v_cache.realize()
+
         # Prepare block tables tensor (fixed shape for JIT)
         bt_tensor, ctx_tensor = self._prepare_tensors_padded(
             block_manager, seq_ids, start_positions

@@ -54,16 +54,13 @@ class KVCache:
             v: Value tensor [n_kv_heads, head_dim]
         """
         # Phase 5: Write to flat tensor [num_blocks, block_size, n_kv_heads, head_dim]
+        # Lazy write - no realize, will be realized when cache is read
         self.k_cache[layer_idx][block_id, offset] = k
-        self.k_cache[layer_idx] = self.k_cache[layer_idx].realize()
-
         self.v_cache[layer_idx][block_id, offset] = v
-        self.v_cache[layer_idx] = self.v_cache[layer_idx].realize()
 
     def write_kv_batch(self, layer_idx: int, block_id: int, start_offset: int, k: Tensor, v: Tensor):
         """
         Write K/V for multiple tokens to a block (for prefill).
-        in phase 6 we will batch write tokens to the KV cache.
 
         Args:
             layer_idx: Which transformer layer
@@ -72,13 +69,11 @@ class KVCache:
             k: Key tensor [num_tokens, n_kv_heads, head_dim]
             v: Value tensor [num_tokens, n_kv_heads, head_dim]
         """
-        end_offset = start_offset + k.shape[0] # start_position + num_tokens
+        end_offset = start_offset + k.shape[0]
 
+        # Lazy write - no realize, will be realized when cache is read
         self.k_cache[layer_idx][block_id, start_offset:end_offset] = k
-        self.k_cache[layer_idx] = self.k_cache[layer_idx].realize()
-
         self.v_cache[layer_idx][block_id, start_offset:end_offset] = v
-        self.v_cache[layer_idx] = self.v_cache[layer_idx].realize()
 
     def get_cache_tensors(self, layer_idx: int) -> Tuple[Tensor, Tensor]:
         """
