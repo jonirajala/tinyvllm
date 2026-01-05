@@ -118,19 +118,36 @@
 - Files: `tinyvllm/engine/jit_decode.py`, `tinyvllm/kernels/paged_attention_jit.py`
 - Enable with: `LLMEngine(..., use_jit=True)`
 
-7.2 Weight Quantization INT8
-**Impact:** 2x throughput | **Status:** Not started
-- Per-channel or per-tensor scale factors
-- 2x compression (2.2GB → 1.1GB) ← directly attacks memory bandwidth bottleneck
-- Minimal quality loss (<1% perplexity)
-- Dequantize on-the-fly during matmul
+7.2 Weight Quantization INT8 ❌
+**Impact:** Theoretical 2x, Actual 4x SLOWER | **Status:** Investigated, not viable with current approach
 
-7.3 Multi-Step Scheduling
-**Impact:** 20-30% improvement | **Status:** Not started
-- Add `num_scheduler_steps` parameter to engine
-- GPU runs N decode iterations without returning to scheduler ← amortizes CPU overhead
-- After N steps, check for finished sequences and new requests
-- Trade-off: higher TTFT at low load (configurable N=1 for latency, N=8+ for throughput)
+**Why it doesn't work:**
+1. **Unfused approach (tinygrad ops):** `w_int8.cast(fp16) * scale` creates separate kernels for cast, multiply, then matmul. Extra memory round-trips make it 3x slower than FP16.
+
+2. **Fused Metal kernel:** We implemented a custom kernel that loads INT8, dequantizes in registers, computes matmul. The kernel itself is 6x faster than FP16 in isolation.
+
+3. **Python overhead kills it:** Custom kernels don't integrate with tinygrad's lazy evaluation. Each of 155 linear layers requires:
+   - Input tensor realize: ~1.75ms
+   - Output allocation: ~0.48ms
+   - Buffer fetching: ~0.36ms
+   - Kernel execution: ~0.23ms (fast!)
+   - **Total: ~2.8ms/layer × 155 layers = 434ms/token**
+
+4. **Result:** 0.30 tok/s INT8 vs 1.22 tok/s FP16 = 4x slower
+
+**What would fix it:**
+- Native tinygrad INT8 matmul support (fused with lazy graph)
+- Or: Write entire model forward pass as single Metal kernel (impractical)
+
+7.3 Multi-Step Scheduling ✅
+**Impact:** Minimal with simple scheduler, future-proofs for complex scheduling | **Status:** Completed
+- Added `num_scheduler_steps` parameter to LLMEngine (default=1)
+- GPU runs N decode iterations per step() call, amortizing scheduler overhead
+- After N steps, checks for finished sequences and new requests
+- Benchmark results: With current simple scheduler, <5% improvement (scheduler not the bottleneck)
+- Future value: Will help when we add priority scheduling, preemption, prefix caching, SLA-based scheduling
+- Trade-off: higher TTFT at low load (N=1 for latency, N=4+ for throughput)
+- Usage: `--num-scheduler-steps 4` or `LLMEngine(..., num_scheduler_steps=4)`
 
 7.4 Reduce Python→GPU Copies
 **Impact:** 2-3x speedup | **Status:** Not started
@@ -307,7 +324,7 @@
 ## Quick Reference
 
 ```
-✅ COMPLETED (Phase 1-7.1):
+✅ COMPLETED (Phase 1-7.3):
    1: Foundation
    2: Paged Attention
    3: Continuous Batching
@@ -315,10 +332,9 @@
    5: Custom Metal Kernel
    6: Metal Kernel Optimizations (online softmax, SIMD)
    7.1: TinyJit for decode       → 1.5-2x ✅
+   7.3: Multi-step scheduling    → <5% (future-proofs) ✅
 
-🎯 NEXT (Phase 7.2+ - Critical):
-   7.2: INT8 weight quantization → 2x
-   7.3: Multi-step scheduling    → 20-30%
+🎯 NEXT (Phase 7.4+ - Critical):
    7.4: Reduce Python→GPU copies → 2-3x
 
 ⏳ THEN (Phase 8 - Performance):
@@ -337,4 +353,5 @@
 ❌ SKIP:
    simdgroup_async_copy (deprecated)
    Buffer pooling (doesn't work)
+   7.2: INT8 quantization (Python overhead makes it 4x slower)
 ```

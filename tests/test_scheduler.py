@@ -94,8 +94,9 @@ class TestHasUnfinished:
         scheduler = Scheduler()
         scheduler.add_request(make_request(0))
         batch = scheduler.schedule()
-        seq_id = batch.scheduled_seqs[0].seq_id
-        scheduler.update({seq_id: 100}, [seq_id])
+        seq = batch.scheduled_seqs[0]
+        seq.append_token(100)
+        scheduler.update([seq.seq_id])
         assert not scheduler.has_unfinished()
 
 
@@ -146,7 +147,8 @@ class TestSchedule:
 
         # Update with tokens but don't finish
         for seq in batch1.scheduled_seqs:
-            scheduler.update({seq.seq_id: 100}, [])
+            seq.append_token(100)
+        scheduler.update([])
 
         # Second schedule - running sequences still included
         batch2 = scheduler.schedule()
@@ -187,7 +189,8 @@ class TestSchedule:
         assert len(batch1.scheduled_seqs) == 1
 
         # Update without finishing
-        scheduler.update({0: 100}, [])
+        batch1.scheduled_seqs[0].append_token(100)
+        scheduler.update([])
 
         # Add more requests
         scheduler.add_request(make_request(1))
@@ -199,43 +202,24 @@ class TestSchedule:
 
 
 class TestUpdate:
-    """Tests for update method."""
+    """Tests for update method.
 
-    def test_update_appends_tokens(self):
-        """Test update appends tokens to sequences."""
-        scheduler = Scheduler()
-        scheduler.add_request(make_request(0))
-        batch = scheduler.schedule()
-        seq = batch.scheduled_seqs[0]
-
-        scheduler.update({seq.seq_id: 100}, [])
-
-        assert seq.output_tokens == [100]
-
-    def test_update_multiple_tokens(self):
-        """Test update with multiple sequences."""
-        scheduler = Scheduler()
-        scheduler.add_request(make_request(0))
-        scheduler.add_request(make_request(1))
-        batch = scheduler.schedule()
-
-        outputs = {seq.seq_id: seq.seq_id + 100 for seq in batch.scheduled_seqs}
-        scheduler.update(outputs, [])
-
-        for seq in batch.scheduled_seqs:
-            assert seq.output_tokens == [seq.seq_id + 100]
+    Note: Tokens are now appended directly to sequences in engine.step().
+    The update() method only handles finished sequence cleanup.
+    """
 
     def test_update_removes_finished(self):
         """Test update removes finished sequences from running."""
         scheduler = Scheduler()
         scheduler.add_request(make_request(0))
         batch = scheduler.schedule()
-        seq_id = batch.scheduled_seqs[0].seq_id
+        seq = batch.scheduled_seqs[0]
 
-        assert seq_id in scheduler.running
-        scheduler.update({seq_id: 100}, [seq_id])
+        assert seq.seq_id in scheduler.running
+        seq.append_token(100)
+        scheduler.update([seq.seq_id])
 
-        assert seq_id not in scheduler.running
+        assert seq.seq_id not in scheduler.running
         assert not scheduler.has_unfinished()
 
     def test_update_sets_finished_status(self):
@@ -245,7 +229,8 @@ class TestUpdate:
         batch = scheduler.schedule()
         seq = batch.scheduled_seqs[0]
 
-        scheduler.update({seq.seq_id: 100}, [seq.seq_id])
+        seq.append_token(100)
+        scheduler.update([seq.seq_id])
 
         assert seq.status == SequenceStatus.FINISHED
 
@@ -256,14 +241,32 @@ class TestUpdate:
         scheduler.add_request(make_request(1))
         batch = scheduler.schedule()
 
-        # Finish only first sequence
-        seq0_id = batch.scheduled_seqs[0].seq_id
-        seq1_id = batch.scheduled_seqs[1].seq_id
-        scheduler.update({seq0_id: 100, seq1_id: 200}, [seq0_id])
+        seq0 = batch.scheduled_seqs[0]
+        seq1 = batch.scheduled_seqs[1]
 
-        assert seq0_id not in scheduler.running
-        assert seq1_id in scheduler.running
+        # Append tokens to both
+        seq0.append_token(100)
+        seq1.append_token(200)
+
+        # Finish only first sequence
+        scheduler.update([seq0.seq_id])
+
+        assert seq0.seq_id not in scheduler.running
+        assert seq1.seq_id in scheduler.running
         assert scheduler.has_unfinished()
+
+    def test_update_no_finished(self):
+        """Test update with no finished sequences."""
+        scheduler = Scheduler()
+        scheduler.add_request(make_request(0))
+        batch = scheduler.schedule()
+        seq = batch.scheduled_seqs[0]
+
+        seq.append_token(100)
+        scheduler.update([])  # No finished
+
+        assert seq.seq_id in scheduler.running
+        assert seq.output_tokens == [100]
 
 
 class TestGetNumWaitingRunning:
@@ -299,8 +302,9 @@ class TestGetNumWaitingRunning:
         scheduler = Scheduler()
         scheduler.add_request(make_request(0))
         batch = scheduler.schedule()
-        seq_id = batch.scheduled_seqs[0].seq_id
-        scheduler.update({seq_id: 100}, [seq_id])
+        seq = batch.scheduled_seqs[0]
+        seq.append_token(100)
+        scheduler.update([seq.seq_id])
 
         assert scheduler.get_num_waiting() == 0
         assert scheduler.get_num_running() == 0
@@ -347,8 +351,9 @@ class TestAbortRequest:
         scheduler = Scheduler()
         scheduler.add_request(make_request(0))
         batch = scheduler.schedule()
-        seq_id = batch.scheduled_seqs[0].seq_id
-        scheduler.update({seq_id: 100}, [seq_id])
+        seq = batch.scheduled_seqs[0]
+        seq.append_token(100)
+        scheduler.update([seq.seq_id])
 
         result = scheduler.abort_request(0)
 
@@ -375,14 +380,16 @@ class TestFullWorkflow:
 
         # Generate tokens
         for i in range(5):
-            scheduler.update({seq.seq_id: 100 + i}, [])
+            seq.append_token(100 + i)
+            scheduler.update([])
             batch = scheduler.schedule()
             assert len(batch.scheduled_seqs) == 1
 
         assert seq.output_tokens == [100, 101, 102, 103, 104]
 
         # Finish
-        scheduler.update({seq.seq_id: 200}, [seq.seq_id])
+        seq.append_token(200)
+        scheduler.update([seq.seq_id])
         assert not scheduler.has_unfinished()
 
     def test_multiple_requests_lifecycle(self):
@@ -399,13 +406,15 @@ class TestFullWorkflow:
 
         # Generate 2 tokens for all
         for _ in range(2):
-            outputs = {seq.seq_id: 100 for seq in scheduler.running.values()}
-            scheduler.update(outputs, [])
+            for seq in scheduler.running.values():
+                seq.append_token(100)
+            scheduler.update([])
 
         # Finish first request
         first_seq_id = list(scheduler.running.keys())[0]
-        outputs = {seq_id: 100 for seq_id in scheduler.running.keys()}
-        scheduler.update(outputs, [first_seq_id])
+        for seq in scheduler.running.values():
+            seq.append_token(100)
+        scheduler.update([first_seq_id])
 
         assert scheduler.get_num_running() == 2
 

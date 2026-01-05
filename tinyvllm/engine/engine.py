@@ -104,6 +104,7 @@ class LLMEngine:
         num_blocks: int = 100,
         block_size: int = 16,
         use_jit: bool = False,
+        num_scheduler_steps: int = 1,
     ):
         """
         Initialize the engine.
@@ -115,12 +116,15 @@ class LLMEngine:
             num_blocks: Number of KV cache blocks (Phase 4)
             block_size: Tokens per block (Phase 4)
             use_jit: Enable JIT compilation for decode (Phase 7.1)
+            num_scheduler_steps: Decode steps per scheduler cycle (Phase 7.3)
+                1 = best latency (default), 4-8 = better throughput
         """
         self.model = model
         self.tokenizer = tokenizer
         self.max_batch_size = max_batch_size
         self.block_size = block_size
         self.use_jit = use_jit
+        self.num_scheduler_steps = num_scheduler_steps
 
         # Phase 4: Create BlockManager for memory allocation
         self.block_manager = BlockManager(
@@ -198,17 +202,17 @@ class LLMEngine:
 
     def step(self) -> List[GenerationOutput]:
         """
-        Run one generation step.
+        Run one or more generation steps.
+
+        Phase 7.3: Multi-step scheduling - runs num_scheduler_steps decode
+        iterations before returning, amortizing scheduler overhead.
 
         This is the core engine loop iteration:
-        1. Get batch from scheduler
-        2. Separate prefill vs decode sequences
-        3. Process prefill one-by-one, decode in batch
-        4. Sample next tokens
-        5. Update scheduler
-        6. Return any finished outputs
-
-        Phase 4: Uses BlockManager for slot allocation and batched decode.
+        1. Get batch from scheduler (once per step() call)
+        2. Process prefill sequences one-by-one
+        3. Run multi-step decode loop
+        4. Update scheduler (once at end)
+        5. Return finished outputs
 
         Returns:
             List of GenerationOutput for requests that finished this step
@@ -218,7 +222,6 @@ class LLMEngine:
             return []
 
         finished_outputs = []
-        seq_outputs = {}      # seq_id -> new token
         finished_seqs = []    # seq_ids that finished
 
         # Separate prefill and decode sequences
@@ -248,25 +251,36 @@ class LLMEngine:
                 request.sampling_params,
                 seq.get_all_tokens()
             )[0]
-            seq_outputs[seq.seq_id] = next_token
+
+            # Append token immediately (needed for multi-step)
+            seq.append_token(next_token)
 
             finish_reason = self._check_finished(next_token, seq, request)
             if finish_reason:
                 finished_seqs.append(seq.seq_id)
                 finished_outputs.append(GenerationOutput(
                     request_id=request.request_id,
-                    text=self.tokenizer.decode(seq.output_tokens + [next_token]),
-                    tokens=seq.output_tokens + [next_token],
+                    text=self.tokenizer.decode(seq.output_tokens),
+                    tokens=seq.output_tokens.copy(),
                     finish_reason=finish_reason
                 ))
+            else:
+                # Not finished - add to decode for remaining steps
+                decode_seqs.append(seq)
 
-        # Process decode sequences in batch (all have 1 token)
-        if decode_seqs:
+        # Multi-step decode loop (Phase 7.3)
+        active_decode_seqs = decode_seqs
+
+        for step_idx in range(self.num_scheduler_steps):
+            if not active_decode_seqs:
+                break
+
+            # Prepare batch
             tokens_list = []
             seq_ids = []
             start_positions = []
 
-            for seq in decode_seqs:
+            for seq in active_decode_seqs:
                 last_token = seq.output_tokens[-1]
                 tokens_list.append(last_token)
                 seq_ids.append(seq.seq_id)
@@ -281,7 +295,7 @@ class LLMEngine:
                     start_positions=start_positions
                 )
             else:
-                input_ids = Tensor(tokens_list).reshape(len(decode_seqs), 1)
+                input_ids = Tensor(tokens_list).reshape(len(active_decode_seqs), 1)
                 logits = self.model.batched_decode(
                     input_ids,
                     kv_cache=self.kv_cache,
@@ -292,28 +306,35 @@ class LLMEngine:
 
             # Sample tokens for entire batch at once
             batch_logits = logits[:, 0, :]  # [batch, vocab_size]
-            params_list = [self.requests[s.request_id].sampling_params for s in decode_seqs]
-            seen_tokens_batch = [s.get_all_tokens() for s in decode_seqs]
+            params_list = [self.requests[s.request_id].sampling_params for s in active_decode_seqs]
+            seen_tokens_batch = [s.get_all_tokens() for s in active_decode_seqs]
             next_tokens = sample_tokens(batch_logits, params_list, seen_tokens_batch)
 
             # Process results
-            for i, seq in enumerate(decode_seqs):
+            still_active = []
+            for i, seq in enumerate(active_decode_seqs):
                 next_token = next_tokens[i]
                 request = self.requests[seq.request_id]
-                seq_outputs[seq.seq_id] = next_token
+
+                # Append token immediately (needed for next step's input)
+                seq.append_token(next_token)
 
                 finish_reason = self._check_finished(next_token, seq, request)
                 if finish_reason:
                     finished_seqs.append(seq.seq_id)
                     finished_outputs.append(GenerationOutput(
                         request_id=request.request_id,
-                        text=self.tokenizer.decode(seq.output_tokens + [next_token]),
-                        tokens=seq.output_tokens + [next_token],
+                        text=self.tokenizer.decode(seq.output_tokens),
+                        tokens=seq.output_tokens.copy(),
                         finish_reason=finish_reason
                     ))
+                else:
+                    still_active.append(seq)
 
-        # Update scheduler with results (also frees blocks for finished seqs)
-        self.scheduler.update(seq_outputs, finished_seqs)
+            active_decode_seqs = still_active
+
+        # Update scheduler (tokens already appended, just handle finished)
+        self.scheduler.update(finished_seqs)
 
         return finished_outputs
 
@@ -358,9 +379,11 @@ class LLMEngine:
         """
         Check if sequence should finish.
 
+        Note: Called AFTER token is appended to sequence (Phase 7.3 change).
+
         Args:
-            token: Just-generated token
-            sequence: The sequence
+            token: Just-generated token (already appended)
+            sequence: The sequence (with token already appended)
             request: The request
 
         Returns:
@@ -368,7 +391,8 @@ class LLMEngine:
         """
         if token == self.tokenizer.eos_id:
             return 'eos'
-        if sequence.get_output_len() + 1 >= request.sampling_params.max_tokens:
+        # Token already appended, so check get_output_len() directly
+        if sequence.get_output_len() >= request.sampling_params.max_tokens:
             return 'length'
         return None
 

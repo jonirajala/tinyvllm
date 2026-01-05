@@ -86,27 +86,21 @@ class Scheduler:
 
         return batch
 
-    def update(
-        self,
-        seq_outputs: Dict[int, int],
-        finished_seqs: List[int],
-    ) -> None:
+    def update(self, finished_seqs: List[int]) -> None:
         """
-        Update sequences after a batch step.
+        Update scheduler after decode step(s).
+
+        Removes finished sequences and frees their blocks.
+        Note: Tokens are appended directly to sequences in engine.step(),
+        so this method only handles cleanup.
 
         Args:
-            seq_outputs: Dict of seq_id -> generated token
             finished_seqs: List of seq_ids that finished
         """
-        for seq_id, token in seq_outputs.items():
-            if seq_id in self.running:
-                self.running[seq_id].append_token(token)
-
         for seq_id in finished_seqs:
             if seq_id in self.running:
                 self.running[seq_id].status = SequenceStatus.FINISHED
                 del self.running[seq_id]
-                # Phase 4: Free blocks when sequence finishes
                 if self.block_manager is not None:
                     self.block_manager.free_sequence(seq_id)
 

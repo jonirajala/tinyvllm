@@ -28,6 +28,8 @@ def main():
     parser.add_argument("--top-p", type=float, default=0.95, help="Nucleus sampling threshold")
     parser.add_argument("--repetition-penalty", type=float, default=1.0, help="Repetition penalty")
     parser.add_argument("--device", type=str, help="Device to run on (CPU, CUDA, METAL)")
+    parser.add_argument("--num-scheduler-steps", type=int, default=1,
+                        help="Decode steps per scheduler cycle (1=low latency, 4+=high throughput)")
     args = parser.parse_args()
 
     # Set device if specified
@@ -51,7 +53,7 @@ def main():
     tokenizer = load_tokenizer(args.model)
 
     # Create engine
-    engine = LLMEngine(model, tokenizer)
+    engine = LLMEngine(model, tokenizer, num_scheduler_steps=args.num_scheduler_steps)
 
     # Create sampling params
     params = SamplingParams(
