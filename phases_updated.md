@@ -1,6 +1,8 @@
+
 # tinyvllm Implementation Roadmap (Priority-Ordered)
 
-**Current Status:** 1.9 tok/s achieved vs 55 tok/s theoretical (3.5% utilization)
+**Current Status:** 1.7 tok/s single / 3.6 tok/s batched vs 55 tok/s theoretical (6.6% utilization)
+**Progress:** Phase 7 complete (+42% single, +33% batched vs Phase 6.2)
 **Primary Bottleneck:** Python→GPU scheduling overhead, NOT kernel speed
 
 ---
@@ -221,8 +223,8 @@
 
 9.4 Prefill Optimization
 **Status:** Not started
-- Chunked prefill (don't block on long prompts)
-- Batched prefill (process multiple prefill sequences together)
+- Chunked prefill (don't block on long prompts) vLLM does this - singel decode prefill loop
+- Batched prefill (process multiple prefill sequences together) 
 
 ---
 
@@ -354,3 +356,4 @@
    Buffer pooling (doesn't work)
    7.2: INT8 quantization (Python overhead makes it 4x slower)
 ```
+

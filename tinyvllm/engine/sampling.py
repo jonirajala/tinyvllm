@@ -99,19 +99,19 @@ def _top_p_filter(logits: Tensor, p: float) -> Tensor:
     return Tensor(filtered)
 
 
-def _multinomial_sample(logits: Tensor) -> Tensor:
-    """Sample using Gumbel-max trick, returning tensor (no sync).
+def _multinomial_sample(logits: Tensor) -> int:
+    """Sample using Gumbel-max trick.
 
     Args:
-        logits: [vocab_size] or [batch, vocab_size] tensor
+        logits: [vocab_size] tensor
 
     Returns:
-        Token index tensor (call .item() or .tolist() to get Python value)
+        Sampled token index
     """
     u = Tensor.rand(logits.shape)
     u = u.clip(1e-10, 1.0 - 1e-10)
     gumbel_noise = -(-u.log()).log()
-    return (logits + gumbel_noise).argmax(axis=-1)
+    return int((logits + gumbel_noise).argmax(axis=-1).item())
 
 
 def _repetition_penalty(logits: Tensor, penalty: float, seen_tokens: List[int]) -> Tensor:
@@ -151,23 +151,18 @@ def _repetition_penalty(logits: Tensor, penalty: float, seen_tokens: List[int]) 
     return logits * penalty_mult
 
 
-def _sample_single(logits: Tensor, params: SamplingParams) -> Tensor:
-    """Sample a single token on GPU, returning tensor.
+def _sample_single(logits: Tensor, params: SamplingParams) -> int:
+    """Sample a single token.
 
-    Internal function - use sample_tokens() instead.
+    TODO: Replace with true batched sampling - vectorize temperature/top_k/top_p
+    across batch dimension to avoid per-sequence loop in sample_tokens().
     """
-    # Greedy decoding
     if params.temperature == 0.0:
-        return logits.argmax()
+        return int(logits.argmax().item())
 
-    # Temperature scaling
     logits = logits / params.temperature
-
-    # Top-k filtering
     if params.top_k > 0:
         logits = _top_k_filter(logits, params.top_k)
-
-    # Top-p filtering
     if params.top_p < 1.0:
         logits = _top_p_filter(logits, params.top_p)
 
@@ -176,63 +171,31 @@ def _sample_single(logits: Tensor, params: SamplingParams) -> Tensor:
 
 def sample_tokens(
     logits: Tensor,
-    params: Union[SamplingParams, List[SamplingParams]],
-    seen_tokens: Optional[Union[List[int], List[List[int]]]] = None,
+    params: List[SamplingParams],
+    seen_tokens: Optional[List[List[int]]] = None,
 ) -> List[int]:
-    """Sample tokens from logits.
+    """Sample tokens from logits (batched).
 
-    Handles both single and batched sampling with a single sync at the end.
+    TODO: True batched sampling - vectorize the loop below. Currently loops
+    per-sequence because params can differ. Could group by similar params
+    or use masked operations for temperature/top_k/top_p.
 
     Args:
-        logits: [vocab_size] or [batch, vocab_size] logits
-        params: SamplingParams for single, or list of SamplingParams for batch
-        seen_tokens: optional token ids for repetition penalty
-            - For single: List[int]
-            - For batch: List[List[int]]
+        logits: [batch, vocab_size] logits
+        params: list of SamplingParams, one per sequence
+        seen_tokens: optional list of token id lists for repetition penalty
 
     Returns:
-        List of sampled token ids (length 1 for single, batch_size for batch)
-
-    Note:
-        Current implementation loops per-sequence but minimizes syncs (single
-        realize() at end). True batched sampling would require:
-        - Vectorized temperature: logits / temps[:, None]
-        - Batched top-k: use max(k) across batch, then per-sequence masking
-        - Batched top-p: similar approach with max(p)
-        - Batched Gumbel-max: already works on [batch, vocab] tensors
-        Challenge: mixed params per sequence makes full vectorization complex.
-        Could group sequences by similar params for partial batching.
+        List of sampled token ids (length = batch_size)
     """
-    # Handle single case
-    if isinstance(params, SamplingParams):
-        seq_logits = logits
-        if params.repetition_penalty != 1.0 and seen_tokens:
-            seq_logits = _repetition_penalty(seq_logits, params.repetition_penalty, seen_tokens)
-        token_tensor = _sample_single(seq_logits, params)
-        return [int(token_tensor.realize().tolist())]
-
-    # Handle batched case
-    params_list = params
-    seen_tokens_batch = seen_tokens
     batch_size = logits.shape[0]
-    assert len(params_list) == batch_size
+    assert len(params) == batch_size
 
-    # TODO: True batched sampling - currently loops per-sequence, only benefit
-    # is single sync at end instead of N syncs
     results = []
-
     for i in range(batch_size):
-        seq_logits = logits[i]
-        seq_params = params_list[i]
+        seq_logits, seq_params = logits[i], params[i]
+        if seq_params.repetition_penalty != 1.0 and seen_tokens and seen_tokens[i]:
+            seq_logits = _repetition_penalty(seq_logits, seq_params.repetition_penalty, seen_tokens[i])
+        results.append(_sample_single(seq_logits, seq_params))
+    return results
 
-        # Apply repetition penalty if needed
-        if seq_params.repetition_penalty != 1.0 and seen_tokens_batch and seen_tokens_batch[i]:
-            seq_logits = _repetition_penalty(seq_logits, seq_params.repetition_penalty, seen_tokens_batch[i])
-
-        # GPU sampling
-        token_tensor = _sample_single(seq_logits, seq_params)
-        results.append(token_tensor)
-
-    # Stack and single sync
-    stacked = Tensor.stack(*results) if len(results) > 1 else results[0].reshape(1)
-    return stacked.realize().tolist()

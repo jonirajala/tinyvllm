@@ -118,36 +118,36 @@ class TestTopPFilter:
 class TestMultinomialSample:
     """Tests for multinomial sampling."""
 
-    def test_returns_tensor(self):
-        """Should return a Tensor, not an int."""
+    def test_returns_int(self):
+        """Should return an int."""
         logits = Tensor([1.0, 2.0, 3.0])
         result = _multinomial_sample(logits)
-        assert isinstance(result, Tensor)
+        assert isinstance(result, int)
 
     def test_returns_valid_index(self):
         """Should return an index within vocab range."""
         logits = Tensor([1.0, 2.0, 3.0])
-        idx = int(_multinomial_sample(logits).realize().tolist())
+        idx = _multinomial_sample(logits)
         assert 0 <= idx < 3
 
     def test_higher_logits_more_likely(self):
         """Higher logits should be sampled more often."""
         logits = Tensor([0.0, 0.0, 10.0])  # token 2 is much more likely
-        samples = [int(_multinomial_sample(logits).realize().tolist()) for _ in range(50)]
+        samples = [_multinomial_sample(logits) for _ in range(50)]
         # Token 2 should dominate
         assert samples.count(2) >= 40
 
     def test_uniform_logits_give_variety(self):
         """Equal logits should give roughly uniform sampling."""
         logits = Tensor([0.0, 0.0, 0.0, 0.0])
-        samples = [int(_multinomial_sample(logits).realize().tolist()) for _ in range(100)]
+        samples = [_multinomial_sample(logits) for _ in range(100)]
         # Should see multiple different tokens
         assert len(set(samples)) >= 3
 
     def test_handles_negative_inf(self):
         """Should handle -inf logits (masked tokens)."""
         logits = Tensor([float("-inf"), float("-inf"), 5.0, float("-inf")])
-        samples = [int(_multinomial_sample(logits).realize().tolist()) for _ in range(20)]
+        samples = [_multinomial_sample(logits) for _ in range(20)]
         # Only token 2 should be sampled
         assert all(s == 2 for s in samples)
 
@@ -188,11 +188,11 @@ class TestRepetitionPenalty:
 class TestSampleTokens:
     """Tests for sample_tokens function."""
 
-    # Single sequence tests
+    # Batch size 1 tests
     def test_single_greedy(self):
         """Temperature 0 should always return argmax."""
-        logits = Tensor([1.0, 5.0, 3.0])
-        params = SamplingParams(temperature=0.0, top_k=0, top_p=1.0)
+        logits = Tensor([[1.0, 5.0, 3.0]])
+        params = [SamplingParams(temperature=0.0, top_k=0, top_p=1.0)]
 
         for _ in range(10):
             result = sample_tokens(logits, params)
@@ -200,8 +200,8 @@ class TestSampleTokens:
 
     def test_single_respects_top_k(self):
         """With top_k, should only sample from top k tokens."""
-        logits = Tensor([1.0, 2.0, 10.0, 3.0])  # token 2 is highest
-        params = SamplingParams(temperature=1.0, top_k=1, top_p=1.0)
+        logits = Tensor([[1.0, 2.0, 10.0, 3.0]])  # token 2 is highest
+        params = [SamplingParams(temperature=1.0, top_k=1, top_p=1.0)]
 
         for _ in range(10):
             result = sample_tokens(logits, params)
@@ -209,25 +209,25 @@ class TestSampleTokens:
 
     def test_single_respects_top_p(self):
         """With low top_p, should restrict to high-probability tokens."""
-        logits = Tensor([0.0, 0.0, 10.0, 0.0])  # token 2 dominant
-        params = SamplingParams(temperature=1.0, top_k=0, top_p=0.5)
+        logits = Tensor([[0.0, 0.0, 10.0, 0.0]])  # token 2 dominant
+        params = [SamplingParams(temperature=1.0, top_k=0, top_p=0.5)]
 
         samples = [sample_tokens(logits, params)[0] for _ in range(10)]
         assert samples.count(2) >= 8
 
     def test_single_with_repetition_penalty(self):
         """Should apply repetition penalty."""
-        logits = Tensor([10.0, 1.0, 1.0])  # token 0 is dominant
-        params = SamplingParams(temperature=0.0, repetition_penalty=100.0)
+        logits = Tensor([[10.0, 1.0, 1.0]])  # token 0 is dominant
+        params = [SamplingParams(temperature=0.0, repetition_penalty=100.0)]
 
         # With heavy penalty on token 0, should pick another
-        result = sample_tokens(logits, params, [0])
+        result = sample_tokens(logits, params, [[0]])
         assert result[0] != 0
 
-    def test_single_returns_list(self):
-        """Single case should return list of length 1."""
-        logits = Tensor([1.0, 2.0, 3.0])
-        params = SamplingParams(temperature=0.0)
+    def test_batch_size_1_returns_list(self):
+        """Batch size 1 should return list of length 1."""
+        logits = Tensor([[1.0, 2.0, 3.0]])
+        params = [SamplingParams(temperature=0.0)]
         result = sample_tokens(logits, params)
 
         assert isinstance(result, list)

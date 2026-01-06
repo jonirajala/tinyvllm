@@ -273,7 +273,7 @@ def benchmark_inference_breakdown(
 
     # Sample first token
     with profiler.time("3. Sampling"):
-        next_token = sample_tokens(logits[0, -1, :], sampling_params, prompt_tokens)[0]
+        next_token = sample_tokens(logits[:, -1, :], [sampling_params], [prompt_tokens])[0]
 
     generated_tokens = [next_token]
 
@@ -306,7 +306,7 @@ def benchmark_inference_breakdown(
         # --- Sampling ---
         with profiler.time("3. Sampling"):
             all_tokens = prompt_tokens + generated_tokens
-            next_token = sample_tokens(logits[0, -1, :], sampling_params, all_tokens)[0]
+            next_token = sample_tokens(logits[:, -1, :], [sampling_params], [all_tokens])[0]
 
         generated_tokens.append(next_token)
         block_manager.advance_position(seq_id)

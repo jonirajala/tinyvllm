@@ -218,21 +218,13 @@ class LLMEngine:
             List of GenerationOutput for requests that finished this step
         """
         batch = self.scheduler.schedule()
-        if not batch.scheduled_seqs:
-            return []
+        if not batch.scheduled_seqs: return []
 
-        finished_outputs = []
-        finished_seqs = []    # seq_ids that finished
+        finished_outputs, finished_seqs = [], []
 
         # Separate prefill and decode sequences
-        prefill_seqs = []
-        decode_seqs = []
-
-        for seq in batch.scheduled_seqs:
-            if seq.get_output_len() == 0:
-                prefill_seqs.append(seq)
-            else:
-                decode_seqs.append(seq)
+        prefill_seqs = [s for s in batch.scheduled_seqs if s.get_output_len() == 0]
+        decode_seqs = [s for s in batch.scheduled_seqs if s.get_output_len() > 0]
 
         # Process prefill sequences one-by-one (different lengths)
         for seq in prefill_seqs:
@@ -247,12 +239,11 @@ class LLMEngine:
             )
             # Sample next token
             next_token = sample_tokens(
-                logits[0, -1, :],
-                request.sampling_params,
-                seq.get_all_tokens()
+                logits[:, -1, :],  # [1, vocab_size]
+                [request.sampling_params],
+                [seq.get_all_tokens()]
             )[0]
 
-            # Append token immediately (needed for multi-step)
             seq.append_token(next_token)
 
             finish_reason = self._check_finished(next_token, seq, request)
@@ -264,27 +255,16 @@ class LLMEngine:
                     tokens=seq.output_tokens.copy(),
                     finish_reason=finish_reason
                 ))
-            else:
-                # Not finished - add to decode for remaining steps
-                decode_seqs.append(seq)
+            # Sequence stays in self.running - will be scheduled for decode on next step()
 
-        # Multi-step decode loop (Phase 7.3)
-        active_decode_seqs = decode_seqs
-
+        # Multi-step decode loop (Phase 7.3) - only for sequences already in decode phase
         for step_idx in range(self.num_scheduler_steps):
-            if not active_decode_seqs:
-                break
+            if not decode_seqs: break
 
             # Prepare batch
-            tokens_list = []
-            seq_ids = []
-            start_positions = []
-
-            for seq in active_decode_seqs:
-                last_token = seq.output_tokens[-1]
-                tokens_list.append(last_token)
-                seq_ids.append(seq.seq_id)
-                start_positions.append(seq.get_len() - 1)
+            tokens_list = [s.output_tokens[-1] for s in decode_seqs]
+            seq_ids = [s.seq_id for s in decode_seqs]
+            start_positions = [s.get_len() - 1 for s in decode_seqs]
 
             # Phase 7.4: Build block_tables and context_lens tensors once
             # (eliminates 32x per-layer Python list → Tensor conversions)
@@ -299,7 +279,7 @@ class LLMEngine:
                     start_positions=start_positions
                 )
             else:
-                input_ids = Tensor(tokens_list).reshape(len(active_decode_seqs), 1)
+                input_ids = Tensor(tokens_list).reshape(len(decode_seqs), 1)
                 logits = self.model.batched_decode(
                     input_ids,
                     kv_cache=self.kv_cache,
@@ -312,32 +292,25 @@ class LLMEngine:
 
             # Sample tokens for entire batch at once
             batch_logits = logits[:, 0, :]  # [batch, vocab_size]
-            params_list = [self.requests[s.request_id].sampling_params for s in active_decode_seqs]
-            seen_tokens_batch = [s.get_all_tokens() for s in active_decode_seqs]
+            params_list = [self.requests[s.request_id].sampling_params for s in decode_seqs]
+            seen_tokens_batch = [s.get_all_tokens() for s in decode_seqs]
             next_tokens = sample_tokens(batch_logits, params_list, seen_tokens_batch)
 
             # Process results
             still_active = []
-            for i, seq in enumerate(active_decode_seqs):
-                next_token = next_tokens[i]
-                request = self.requests[seq.request_id]
-
-                # Append token immediately (needed for next step's input)
+            for seq, next_token in zip(decode_seqs, next_tokens):
                 seq.append_token(next_token)
-
-                finish_reason = self._check_finished(next_token, seq, request)
-                if finish_reason:
+                if finish_reason := self._check_finished(next_token, seq, self.requests[seq.request_id]):
                     finished_seqs.append(seq.seq_id)
                     finished_outputs.append(GenerationOutput(
-                        request_id=request.request_id,
+                        request_id=seq.request_id,
                         text=self.tokenizer.decode(seq.output_tokens),
                         tokens=seq.output_tokens.copy(),
                         finish_reason=finish_reason
                     ))
                 else:
                     still_active.append(seq)
-
-            active_decode_seqs = still_active
+            decode_seqs = still_active
 
         # Update scheduler (tokens already appended, just handle finished)
         self.scheduler.update(finished_seqs)

@@ -28,7 +28,7 @@ def main():
     parser.add_argument("--top-p", type=float, default=0.95, help="Nucleus sampling threshold")
     parser.add_argument("--repetition-penalty", type=float, default=1.0, help="Repetition penalty")
     parser.add_argument("--device", type=str, help="Device to run on (CPU, CUDA, METAL)")
-    parser.add_argument("--num-scheduler-steps", type=int, default=1,
+    parser.add_argument("--num-scheduler-steps", type=int, default=4,
                         help="Decode steps per scheduler cycle (1=low latency, 4+=high throughput)")
     args = parser.parse_args()
 
