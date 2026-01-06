@@ -29,6 +29,7 @@ import math
 from tinygrad import Tensor
 
 from ..kernels import fused_paged_attention
+from ..kernels.paged_attention_tinygrad import fused_paged_attention_tinygrad
 
 
 def create_causal_mask(seq_len: int, start_pos: int = 0) -> Tensor:
@@ -257,5 +258,49 @@ def decode_attention(
 
     return fused_paged_attention(
         queries_stacked, k_cache, v_cache, block_tables, context_lens,
+        n_heads, kv_cache.n_kv_heads, head_dim, kv_cache.block_size
+    )
+
+
+def decode_attention_with_tensors(
+    queries: List[Tensor],
+    kv_cache,
+    block_tables_tensor: Tensor,
+    context_lens_tensor: Tensor,
+    layer_idx: int,
+) -> Tensor:
+    """
+    Attention for decode phase using pre-built tensors.
+
+    Phase 7.4 optimization: Accepts Tensors directly instead of Python lists,
+    eliminating the per-layer list→tensor conversion overhead.
+
+    Called via: engine → model.batched_decode() → layer.batched_forward()
+                → attention.batched_forward() → decode_attention_with_tensors()
+
+    Args:
+        queries: List of [1, 1, n_heads, head_dim] tensors, one per sequence
+        kv_cache: Block-based KVCache instance
+        block_tables_tensor: [batch, max_blocks] int32 - pre-built tensor
+        context_lens_tensor: [batch] int32 - pre-built tensor
+        layer_idx: Which layer
+
+    Returns:
+        output: [batch, 1, n_heads, head_dim]
+    """
+    if not queries:
+        return Tensor.zeros(0, 1, 1, 1)
+
+    # Get dimensions from first query
+    _, _, n_heads, head_dim = queries[0].shape
+
+    # Stack queries into single tensor [batch, 1, n_heads, head_dim]
+    queries_stacked = Tensor.cat(*queries, dim=0)
+    k_cache, v_cache = kv_cache.get_cache_tensors(layer_idx)
+
+    # Direct call to tensor version - no list→tensor conversion
+    return fused_paged_attention_tinygrad(
+        queries_stacked, k_cache, v_cache,
+        block_tables_tensor, context_lens_tensor,
         n_heads, kv_cache.n_kv_heads, head_dim, kv_cache.block_size
     )

@@ -11,7 +11,7 @@ from tinygrad.nn import Embedding, Linear
 from .weights import LlamaConfig
 from ..core.kv_cache import KVCache
 from ..core.block_manager import BlockManager
-from ..core.attention_utils import prefill_attention, decode_attention
+from ..core.attention_utils import prefill_attention, decode_attention, decode_attention_with_tensors
 
 
 
@@ -186,6 +186,8 @@ class Attention:
         layer_idx: int,
         seq_ids: List[int],
         start_positions: List[int],
+        block_tables_tensor: Optional[Tensor] = None,
+        context_lens_tensor: Optional[Tensor] = None,
     ) -> Tensor:
         """Batched forward for decode (single token per sequence).
 
@@ -197,6 +199,8 @@ class Attention:
             layer_idx: Which layer
             seq_ids: List of sequence IDs
             start_positions: Start position for each sequence
+            block_tables_tensor: [batch, max_blocks] int32 - Phase 7.4 optimization
+            context_lens_tensor: [batch] int32 - Phase 7.4 optimization
 
         Returns:
             output: [batch, 1, dim]
@@ -213,28 +217,30 @@ class Attention:
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
 
-        # Write K/V and compute attention for each sequence
+        # Write K/V to blocks and collect queries
         queries = []
-        block_tables = []
-        context_lens = []
-
         for i, (seq_id, start_pos) in enumerate(zip(seq_ids, start_positions)):
             # Write this sequence's K/V to its blocks
             self._write_kv_to_blocks(
                 kv_cache, block_manager, layer_idx, seq_id,
                 k[i], v[i], start_pos
             )
-
-            # Collect info for batched attention
             queries.append(q[i:i+1])  # Keep batch dim
-            block_tables.append(block_manager.get_block_table(seq_id))
-            context_lens.append(start_pos + 1)
 
-        # Batched attention
-        out = decode_attention(
-            queries, kv_cache, block_tables, context_lens,
-            layer_idx, start_positions
-        )
+        # Phase 7.4: Use pre-built tensors if available (eliminates per-layer conversion)
+        if block_tables_tensor is not None and context_lens_tensor is not None:
+            out = decode_attention_with_tensors(
+                queries, kv_cache, block_tables_tensor, context_lens_tensor,
+                layer_idx
+            )
+        else:
+            # Fallback: Build lists per-layer (original path)
+            block_tables = [block_manager.get_block_table(seq_id) for seq_id in seq_ids]
+            context_lens = [sp + 1 for sp in start_positions]
+            out = decode_attention(
+                queries, kv_cache, block_tables, context_lens,
+                layer_idx, start_positions
+            )
 
         # Project output - batched
         out = out.reshape(batch, 1, -1)
@@ -294,12 +300,15 @@ class TransformerBlock:
         layer_idx: int,
         seq_ids: List[int],
         start_positions: List[int],
+        block_tables_tensor: Optional[Tensor] = None,
+        context_lens_tensor: Optional[Tensor] = None,
     ) -> Tensor:
         """Batched forward for decode (single token per sequence)."""
         # Attention with residual - batched
         h = self.attention.batched_forward(
             self.attention_norm(x), cos, sin, kv_cache, block_manager,
-            layer_idx, seq_ids, start_positions
+            layer_idx, seq_ids, start_positions,
+            block_tables_tensor, context_lens_tensor
         )
         x = x + h
         # FFN with residual - batched (naturally handles batch dim)
@@ -379,6 +388,8 @@ class Llama:
         block_manager: BlockManager,
         seq_ids: List[int],
         start_positions: List[int],
+        block_tables_tensor: Optional[Tensor] = None,
+        context_lens_tensor: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Batched decode forward pass for multiple sequences.
@@ -386,12 +397,17 @@ class Llama:
         Phase 4: Process multiple decode sequences in one forward pass.
         Each sequence generates one token but we batch the computation.
 
+        Phase 7.4: Optionally accepts pre-built block_tables_tensor and
+        context_lens_tensor to eliminate per-layer Python list→Tensor conversion.
+
         Args:
             tokens: Input token IDs [batch, 1] - one token per sequence
             kv_cache: KVCache instance for paged attention
             block_manager: BlockManager for slot allocation
             seq_ids: List of sequence IDs
             start_positions: Start position for each sequence
+            block_tables_tensor: [batch, max_blocks] int32 - Phase 7.4 optimization
+            context_lens_tensor: [batch] int32 - Phase 7.4 optimization
 
         Returns:
             logits: Output logits [batch, 1, vocab_size]
@@ -411,7 +427,8 @@ class Llama:
         for layer_idx, layer in enumerate(self.layers):
             h = layer.batched_forward(
                 h, cos, sin, kv_cache, block_manager,
-                layer_idx, seq_ids, start_positions
+                layer_idx, seq_ids, start_positions,
+                block_tables_tensor, context_lens_tensor
             )
 
         # Advance positions for all sequences

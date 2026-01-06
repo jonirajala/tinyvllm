@@ -38,7 +38,7 @@ Or step-by-step:
 """
 
 from dataclasses import dataclass
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterator, List, Optional, Tuple
 
 from tinygrad import Tensor, dtypes
 
@@ -286,6 +286,10 @@ class LLMEngine:
                 seq_ids.append(seq.seq_id)
                 start_positions.append(seq.get_len() - 1)
 
+            # Phase 7.4: Build block_tables and context_lens tensors once
+            # (eliminates 32x per-layer Python list → Tensor conversions)
+            bt_tensor, ctx_tensor = self._prepare_batch_tensors(seq_ids, start_positions)
+
             # Batched forward pass - use JIT decoder if enabled
             if self.use_jit and self.jit_decoder is not None:
                 logits = self.jit_decoder.decode(
@@ -301,7 +305,9 @@ class LLMEngine:
                     kv_cache=self.kv_cache,
                     block_manager=self.block_manager,
                     seq_ids=seq_ids,
-                    start_positions=start_positions
+                    start_positions=start_positions,
+                    block_tables_tensor=bt_tensor,
+                    context_lens_tensor=ctx_tensor,
                 )
 
             # Sample tokens for entire batch at once
@@ -395,6 +401,45 @@ class LLMEngine:
         if sequence.get_output_len() >= request.sampling_params.max_tokens:
             return 'length'
         return None
+
+    def _prepare_batch_tensors(
+        self,
+        seq_ids: List[int],
+        start_positions: List[int],
+    ) -> Tuple[Tensor, Tensor]:
+        """Build block_tables and context_lens tensors for batched decode.
+
+        Phase 7.4: Build these once per step instead of per-layer.
+        Eliminates 32x redundant Python list → Tensor conversions.
+
+        Args:
+            seq_ids: List of sequence IDs in the batch
+            start_positions: Start position for each sequence
+
+        Returns:
+            block_tables_tensor: [batch, max_blocks] int32
+            context_lens_tensor: [batch] int32
+        """
+        batch_size = len(seq_ids)
+
+        # Determine max blocks needed (use actual block table sizes)
+        block_tables_raw = [self.block_manager.get_block_table(sid) for sid in seq_ids]
+        max_blocks = max(len(bt) for bt in block_tables_raw) if block_tables_raw else 1
+
+        # Pad block tables and build context lens
+        block_tables_padded = []
+        context_lens = []
+
+        for bt, start_pos in zip(block_tables_raw, start_positions):
+            block_tables_padded.append(bt + [0] * (max_blocks - len(bt)))
+            context_lens.append(start_pos + 1)
+
+        # Flatten and create tensors
+        bt_flat = [b for row in block_tables_padded for b in row]
+        bt_tensor = Tensor(bt_flat, dtype=dtypes.int32).reshape(batch_size, max_blocks)
+        ctx_tensor = Tensor(context_lens, dtype=dtypes.int32)
+
+        return bt_tensor, ctx_tensor
 
 
 def generate_batch(
