@@ -334,10 +334,11 @@ class Llama:
         self.norm = RMSNorm(config.dim, config.norm_eps)
         self.output = Linear(config.dim, config.vocab_size, bias=False)
 
-        # Precompute RoPE frequencies
-        self.cos, self.sin = precompute_freqs_cis(
+        # Precompute RoPE frequencies and realize to GPU
+        cos, sin = precompute_freqs_cis(
             config.head_dim, config.max_seq_len * 2, config.rope_theta
         )
+        self.cos, self.sin = cos.realize(), sin.realize()
 
     def __call__(
         self,
@@ -442,10 +443,10 @@ class Llama:
         """Load pretrained weights into the model.
 
         Weights are cast to config.dtype (auto-detected or explicit).
-        Uses replace() to change dtype, not assign() which preserves target dtype.
+        Directly assigns tensors to break any lazy computation graph links.
         """
-        # Map weight names to model attributes
-        weight_map = self._build_weight_map()
+        # Map weight names to (parent_object, attr_name) for direct assignment
+        weight_map = self._build_weight_assignment_map()
         target_dtype = self.config.dtype
 
         for name, tensor in weights.items():
@@ -455,17 +456,20 @@ class Llama:
                 target_name = self._map_weight_name(name)
 
             if target_name in weight_map:
-                target = weight_map[target_name]
-                # Use replace() to change both data and dtype
-                target.replace(tensor.cast(target_dtype))
+                parent, attr = weight_map[target_name]
+                # Weights are already realized from safe_load
+                # Only cast if dtype doesn't match (avoid unnecessary ops on realized tensors)
+                if tensor.dtype != target_dtype:
+                    tensor = tensor.cast(target_dtype).realize()
+                setattr(parent, attr, tensor)
 
-    def _build_weight_map(self) -> Dict[str, Tensor]:
-        """Build mapping from weight names to tensors."""
+    def _build_weight_assignment_map(self) -> Dict[str, tuple]:
+        """Build mapping from weight names to (parent_object, attr_name) for direct assignment."""
         weight_map = {}
 
         # Embeddings
-        weight_map["model.embed_tokens.weight"] = self.tok_embeddings.weight
-        weight_map["tok_embeddings.weight"] = self.tok_embeddings.weight
+        weight_map["model.embed_tokens.weight"] = (self.tok_embeddings, "weight")
+        weight_map["tok_embeddings.weight"] = (self.tok_embeddings, "weight")
 
         # Layers
         for i, layer in enumerate(self.layers):
@@ -474,34 +478,34 @@ class Llama:
 
             for p in [prefix, alt_prefix]:
                 # Attention
-                weight_map[f"{p}self_attn.q_proj.weight"] = layer.attention.wq.weight
-                weight_map[f"{p}self_attn.k_proj.weight"] = layer.attention.wk.weight
-                weight_map[f"{p}self_attn.v_proj.weight"] = layer.attention.wv.weight
-                weight_map[f"{p}self_attn.o_proj.weight"] = layer.attention.wo.weight
-                weight_map[f"{p}attention.wq.weight"] = layer.attention.wq.weight
-                weight_map[f"{p}attention.wk.weight"] = layer.attention.wk.weight
-                weight_map[f"{p}attention.wv.weight"] = layer.attention.wv.weight
-                weight_map[f"{p}attention.wo.weight"] = layer.attention.wo.weight
+                weight_map[f"{p}self_attn.q_proj.weight"] = (layer.attention.wq, "weight")
+                weight_map[f"{p}self_attn.k_proj.weight"] = (layer.attention.wk, "weight")
+                weight_map[f"{p}self_attn.v_proj.weight"] = (layer.attention.wv, "weight")
+                weight_map[f"{p}self_attn.o_proj.weight"] = (layer.attention.wo, "weight")
+                weight_map[f"{p}attention.wq.weight"] = (layer.attention.wq, "weight")
+                weight_map[f"{p}attention.wk.weight"] = (layer.attention.wk, "weight")
+                weight_map[f"{p}attention.wv.weight"] = (layer.attention.wv, "weight")
+                weight_map[f"{p}attention.wo.weight"] = (layer.attention.wo, "weight")
 
                 # FFN
-                weight_map[f"{p}mlp.gate_proj.weight"] = layer.feed_forward.w1.weight
-                weight_map[f"{p}mlp.down_proj.weight"] = layer.feed_forward.w2.weight
-                weight_map[f"{p}mlp.up_proj.weight"] = layer.feed_forward.w3.weight
-                weight_map[f"{p}feed_forward.w1.weight"] = layer.feed_forward.w1.weight
-                weight_map[f"{p}feed_forward.w2.weight"] = layer.feed_forward.w2.weight
-                weight_map[f"{p}feed_forward.w3.weight"] = layer.feed_forward.w3.weight
+                weight_map[f"{p}mlp.gate_proj.weight"] = (layer.feed_forward.w1, "weight")
+                weight_map[f"{p}mlp.down_proj.weight"] = (layer.feed_forward.w2, "weight")
+                weight_map[f"{p}mlp.up_proj.weight"] = (layer.feed_forward.w3, "weight")
+                weight_map[f"{p}feed_forward.w1.weight"] = (layer.feed_forward.w1, "weight")
+                weight_map[f"{p}feed_forward.w2.weight"] = (layer.feed_forward.w2, "weight")
+                weight_map[f"{p}feed_forward.w3.weight"] = (layer.feed_forward.w3, "weight")
 
                 # Norms
-                weight_map[f"{p}input_layernorm.weight"] = layer.attention_norm.weight
-                weight_map[f"{p}post_attention_layernorm.weight"] = layer.ffn_norm.weight
-                weight_map[f"{p}attention_norm.weight"] = layer.attention_norm.weight
-                weight_map[f"{p}ffn_norm.weight"] = layer.ffn_norm.weight
+                weight_map[f"{p}input_layernorm.weight"] = (layer.attention_norm, "weight")
+                weight_map[f"{p}post_attention_layernorm.weight"] = (layer.ffn_norm, "weight")
+                weight_map[f"{p}attention_norm.weight"] = (layer.attention_norm, "weight")
+                weight_map[f"{p}ffn_norm.weight"] = (layer.ffn_norm, "weight")
 
         # Output
-        weight_map["model.norm.weight"] = self.norm.weight
-        weight_map["norm.weight"] = self.norm.weight
-        weight_map["lm_head.weight"] = self.output.weight
-        weight_map["output.weight"] = self.output.weight
+        weight_map["model.norm.weight"] = (self.norm, "weight")
+        weight_map["norm.weight"] = (self.norm, "weight")
+        weight_map["lm_head.weight"] = (self.output, "weight")
+        weight_map["output.weight"] = (self.output, "weight")
 
         return weight_map
 

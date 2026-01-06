@@ -30,6 +30,8 @@ def main():
     parser.add_argument("--device", type=str, help="Device to run on (CPU, CUDA, METAL)")
     parser.add_argument("--num-scheduler-steps", type=int, default=4,
                         help="Decode steps per scheduler cycle (1=low latency, 4+=high throughput)")
+    parser.add_argument("--use-jit", action="store_true",
+                        help="Enable JIT compilation for decode (uses pure tinygrad ops)")
     args = parser.parse_args()
 
     # Set device if specified
@@ -53,7 +55,7 @@ def main():
     tokenizer = load_tokenizer(args.model)
 
     # Create engine
-    engine = LLMEngine(model, tokenizer, num_scheduler_steps=args.num_scheduler_steps)
+    engine = LLMEngine(model, tokenizer, num_scheduler_steps=args.num_scheduler_steps, use_jit=args.use_jit)
 
     # Create sampling params
     params = SamplingParams(

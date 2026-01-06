@@ -3,48 +3,23 @@
 from pathlib import Path
 from typing import Dict, Any
 import json
-import struct
 
 from tinygrad import Tensor, dtypes
+from tinygrad.nn.state import safe_load
 
 
 def load_safetensors(path: Path) -> Dict[str, Tensor]:
-    """Load weights from a safetensors file."""
-    with open(path, "rb") as f:
-        # Read header size (first 8 bytes, little-endian uint64)
-        header_size = struct.unpack("<Q", f.read(8))[0]
-        # Read and parse header JSON
-        header = json.loads(f.read(header_size))
-        # Calculate data start offset
-        data_start = 8 + header_size
-
-        weights = {}
-        for name, info in header.items():
-            if name == "__metadata__":
-                continue
-            dtype_str = info["dtype"]
-            shape = info["shape"]
-            offsets = info["data_offsets"]
-
-            # Map safetensors dtype to tinygrad dtype
-            dtype_map = {
-                "F32": dtypes.float32,
-                "F16": dtypes.float16,
-                "BF16": dtypes.bfloat16,
-                "I32": dtypes.int32,
-                "I64": dtypes.int64,
-            }
-            dtype = dtype_map.get(dtype_str, dtypes.float32)
-
-            # Read tensor data
-            f.seek(data_start + offsets[0])
-            num_bytes = offsets[1] - offsets[0]
-            data = f.read(num_bytes)
-
-            # Create tensor
-            weights[name] = Tensor(data, dtype=dtype).reshape(shape)
-
-        return weights
+    """Load weights from a safetensors file using tinygrad's native loader."""
+    from tinygrad import Device
+    # Use tinygrad's native safetensors loader
+    # Note: safe_load returns tensors on DISK device, need to move to GPU
+    weights = safe_load(str(path))
+    device = Device.DEFAULT
+    result = {}
+    for name, tensor in weights.items():
+        # Move from DISK to GPU device - this triggers the actual load
+        result[name] = tensor.to(device).realize()
+    return result
 
 
 class LlamaConfig:
