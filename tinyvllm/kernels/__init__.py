@@ -9,7 +9,7 @@ Flash Attention: For prefill phase (O(1) memory, direct on fresh K/V)
 
 from tinygrad import Device
 
-# Pure tinygrad versions (device-agnostic, works with TinyJit)
+# Pure tinygrad versions (device-agnostic)
 from .paged_decode_attention_tinygrad import paged_decode_attention_tinygrad
 from .paged_decode_attention_tinygrad import paged_decode_attention_from_lists
 

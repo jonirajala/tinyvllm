@@ -151,7 +151,6 @@ Benchmark results for tinyvllm on Apple Silicon.
 | Date | 2026-01-06 |
 
 **Phase 7 includes:**
-- 7.1 TinyJit for decode loop
 - 7.3 Multi-step scheduling
 - 7.4 Reduce Python→GPU copies
 

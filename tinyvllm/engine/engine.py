@@ -38,7 +38,7 @@ Or step-by-step:
 """
 
 from dataclasses import dataclass
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 from tinygrad import Tensor, dtypes
 
@@ -48,7 +48,7 @@ from ..core.sequence import Request, Sequence
 from ..core.block_manager import BlockManager
 from ..core.kv_cache import KVCache
 from ..engine.sampling import SamplingParams, sample_tokens
-from ..engine.jit_decode import JitDecoder
+from ..engine.output_processor import OutputProcessor
 
 
 @dataclass
@@ -103,8 +103,9 @@ class LLMEngine:
         max_batch_size: int = 8,
         num_blocks: int = 100,
         block_size: int = 16,
-        use_jit: bool = False,
         num_scheduler_steps: int = 1,
+        async_output: bool = False,
+        output_callback: Optional[Callable[[GenerationOutput], None]] = None,
     ):
         """
         Initialize the engine.
@@ -115,15 +116,17 @@ class LLMEngine:
             max_batch_size: Maximum sequences per batch
             num_blocks: Number of KV cache blocks (Phase 4)
             block_size: Tokens per block (Phase 4)
-            use_jit: Enable JIT compilation for decode (Phase 7.1)
             num_scheduler_steps: Decode steps per scheduler cycle (Phase 7.3)
                 1 = best latency (default), 4-8 = better throughput
+            async_output: Enable async detokenization (Phase 8.3)
+                Detokenize on background thread while GPU computes next step
+            output_callback: Callback for async outputs (requires async_output=True)
+                If None, use poll_outputs() to retrieve results
         """
         self.model = model
         self.tokenizer = tokenizer
         self.max_batch_size = max_batch_size
         self.block_size = block_size
-        self.use_jit = use_jit
         self.num_scheduler_steps = num_scheduler_steps
 
         # Phase 4: Create BlockManager for memory allocation
@@ -150,18 +153,12 @@ class LLMEngine:
         # Mappings
         self.requests: Dict[int, Request] = {}  # request_id -> Request
 
-        # Phase 7.1: JIT decoder (optional)
-        self.jit_decoder: Optional[JitDecoder] = None
-        if use_jit:
-            # max_context_len: typical prompt (50-100) + max_tokens (50-100)
-            # Default 256 is reasonable for most use cases
-            max_context = min(256, num_blocks * block_size)
-            self.jit_decoder = JitDecoder(
-                model=model,
-                kv_cache=self.kv_cache,
-                max_batch_size=max_batch_size,
-                max_context_len=max_context,
-            )
+        # Phase 8.3: Output processor (handles both sync and async)
+        self._output_processor = OutputProcessor(
+            tokenizer=self.tokenizer,
+            async_mode=async_output,
+            callback=output_callback,
+        )
 
 
 
@@ -220,7 +217,7 @@ class LLMEngine:
         batch = self.scheduler.schedule()
         if not batch.scheduled_seqs: return []
 
-        finished_outputs, finished_seqs = [], []
+        finished_seqs = []
 
         # Separate prefill and decode sequences
         prefill_seqs = [s for s in batch.scheduled_seqs if s.get_output_len() == 0]
@@ -249,12 +246,11 @@ class LLMEngine:
             finish_reason = self._check_finished(next_token, seq, request)
             if finish_reason:
                 finished_seqs.append(seq.seq_id)
-                finished_outputs.append(GenerationOutput(
+                self._output_processor.submit(
                     request_id=request.request_id,
-                    text=self.tokenizer.decode(seq.output_tokens),
-                    tokens=seq.output_tokens.copy(),
+                    tokens=seq.output_tokens,
                     finish_reason=finish_reason
-                ))
+                )
             # Sequence stays in self.running - will be scheduled for decode on next step()
 
         # Multi-step decode loop (Phase 7.3) - only for sequences already in decode phase
@@ -270,25 +266,17 @@ class LLMEngine:
             # (eliminates 32x per-layer Python list → Tensor conversions)
             bt_tensor, ctx_tensor = self._prepare_batch_tensors(seq_ids, start_positions)
 
-            # Batched forward pass - use JIT decoder if enabled
-            if self.use_jit and self.jit_decoder is not None:
-                logits = self.jit_decoder.decode(
-                    block_manager=self.block_manager,
-                    tokens_list=tokens_list,
-                    seq_ids=seq_ids,
-                    start_positions=start_positions
-                )
-            else:
-                input_ids = Tensor(tokens_list).reshape(len(decode_seqs), 1)
-                logits = self.model.batched_decode(
-                    input_ids,
-                    kv_cache=self.kv_cache,
-                    block_manager=self.block_manager,
-                    seq_ids=seq_ids,
-                    start_positions=start_positions,
-                    block_tables_tensor=bt_tensor,
-                    context_lens_tensor=ctx_tensor,
-                )
+            # Batched forward pass
+            input_ids = Tensor(tokens_list).reshape(len(decode_seqs), 1)
+            logits = self.model.batched_decode(
+                input_ids,
+                kv_cache=self.kv_cache,
+                block_manager=self.block_manager,
+                seq_ids=seq_ids,
+                start_positions=start_positions,
+                block_tables_tensor=bt_tensor,
+                context_lens_tensor=ctx_tensor,
+            )
 
             # Sample tokens for entire batch at once
             batch_logits = logits[:, 0, :]  # [batch, vocab_size]
@@ -302,12 +290,11 @@ class LLMEngine:
                 seq.append_token(next_token)
                 if finish_reason := self._check_finished(next_token, seq, self.requests[seq.request_id]):
                     finished_seqs.append(seq.seq_id)
-                    finished_outputs.append(GenerationOutput(
+                    self._output_processor.submit(
                         request_id=seq.request_id,
-                        text=self.tokenizer.decode(seq.output_tokens),
-                        tokens=seq.output_tokens.copy(),
+                        tokens=seq.output_tokens,
                         finish_reason=finish_reason
-                    ))
+                    )
                 else:
                     still_active.append(seq)
             decode_seqs = still_active
@@ -315,7 +302,7 @@ class LLMEngine:
         # Update scheduler (tokens already appended, just handle finished)
         self.scheduler.update(finished_seqs)
 
-        return finished_outputs
+        return self._output_processor.poll_all()
 
 
     def run(self) -> Iterator[GenerationOutput]:
@@ -327,6 +314,8 @@ class LLMEngine:
         """
         while self.scheduler.has_unfinished():
             yield from self.step()
+        # Drain any remaining async outputs
+        yield from self._output_processor.drain()
 
     def has_unfinished(self) -> bool:
         """
@@ -348,6 +337,33 @@ class LLMEngine:
             True if request was found and aborted
         """
         return self.scheduler.abort_request(request_id)
+
+    def poll_outputs(self) -> List[GenerationOutput]:
+        """
+        Poll for completed outputs.
+
+        Useful for manual control instead of using run().
+
+        Returns:
+            List of completed GenerationOutput objects.
+
+        Example:
+            engine = LLMEngine(..., async_output=True)
+            engine.add_request("Hello")
+            while engine.has_unfinished():
+                engine.step()
+                for output in engine.poll_outputs():
+                    print(output.text)
+        """
+        return self._output_processor.poll_all()
+
+    def shutdown(self) -> None:
+        """
+        Clean shutdown of engine resources.
+
+        Stops the async output processor thread if running.
+        """
+        self._output_processor.shutdown()
 
     def _check_finished(
         self,

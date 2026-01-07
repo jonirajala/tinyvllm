@@ -427,5 +427,3 @@ class PagedAttentionOnline:
 
 # Export with standard name for dispatcher
 paged_decode_attention = PagedAttentionOnline.get_instance().batched
-
-# JIT-compatible version is in paged_attention_jit.py (device-agnostic)

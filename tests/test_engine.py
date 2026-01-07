@@ -460,3 +460,111 @@ class TestEngineEdgeCases:
         result2 = list(engine2.run())[0].text
 
         assert result1 == result2
+
+
+class TestAsyncOutput:
+    """Tests for Phase 8.3: Async Output Processing."""
+
+    def test_async_output_init(self):
+        """Test engine initialization with async_output=True."""
+        config = small_config()
+        model = Llama(config)
+        tokenizer = MockTokenizer()
+
+        engine = LLMEngine(model, tokenizer, async_output=True)
+        assert engine._output_processor is not None
+        assert engine._output_processor.async_mode is True
+        engine.shutdown()
+
+    def test_async_output_run(self):
+        """Test run() with async_output=True produces valid results."""
+        config = small_config()
+        model = Llama(config)
+        tokenizer = MockTokenizer()
+
+        # Run with async
+        engine = LLMEngine(model, tokenizer, async_output=True)
+        engine.add_request("test", SamplingParams(max_tokens=3))
+        outputs = list(engine.run())
+        engine.shutdown()
+
+        # Should produce valid output
+        assert len(outputs) == 1
+        assert outputs[0].request_id == 0
+        assert len(outputs[0].tokens) == 3  # max_tokens=3
+        assert outputs[0].text is not None
+        assert outputs[0].finish_reason == 'length'
+
+    def test_async_output_multiple_requests(self):
+        """Test async output with multiple concurrent requests."""
+        config = small_config()
+        model = Llama(config)
+        tokenizer = MockTokenizer()
+
+        engine = LLMEngine(model, tokenizer, async_output=True)
+
+        engine.add_request("hello", SamplingParams(max_tokens=2))
+        engine.add_request("world", SamplingParams(max_tokens=2))
+        engine.add_request("test", SamplingParams(max_tokens=2))
+
+        outputs = list(engine.run())
+        engine.shutdown()
+
+        assert len(outputs) == 3
+        request_ids = {o.request_id for o in outputs}
+        assert request_ids == {0, 1, 2}
+
+    def test_async_output_callback(self):
+        """Test async output with callback."""
+        config = small_config()
+        model = Llama(config)
+        tokenizer = MockTokenizer()
+
+        received = []
+
+        def on_output(output):
+            received.append(output)
+
+        engine = LLMEngine(model, tokenizer, async_output=True, output_callback=on_output)
+
+        engine.add_request("test", SamplingParams(max_tokens=2))
+        list(engine.run())  # Drive the engine
+        engine.shutdown()
+
+        assert len(received) == 1
+        assert received[0].request_id == 0
+
+    def test_async_output_poll(self):
+        """Test manual polling with poll_outputs()."""
+        config = small_config()
+        model = Llama(config)
+        tokenizer = MockTokenizer()
+
+        engine = LLMEngine(model, tokenizer, async_output=True)
+
+        engine.add_request("test", SamplingParams(max_tokens=1))
+
+        # Step should queue output for async processing
+        engine.step()
+
+        # Give async processor time to complete
+        import time
+        time.sleep(0.05)
+
+        # Poll should return the output
+        outputs = engine.poll_outputs()
+        assert len(outputs) == 1
+        assert outputs[0].request_id == 0
+
+        engine.shutdown()
+
+    def test_poll_outputs_empty_when_sync(self):
+        """poll_outputs() should return empty list when async_output=False."""
+        config = small_config()
+        model = Llama(config)
+        tokenizer = MockTokenizer()
+
+        engine = LLMEngine(model, tokenizer, async_output=False)
+
+        outputs = engine.poll_outputs()
+        assert outputs == []

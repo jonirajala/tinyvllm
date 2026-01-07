@@ -268,7 +268,7 @@ def run_benchmarks(model_path: Optional[str] = None):
     print("=" * 50)
     print(theoretical.report())
 
-    # Warmup - multiple runs to ensure JIT is warmed
+    # Warmup - multiple runs to ensure tinygrad kernels are compiled
     print("\n" + "=" * 50)
     print("Benchmarks")
     print("=" * 50)

@@ -3,7 +3,6 @@
 Unlike the custom Metal/CUDA kernels which use device-specific APIs,
 this implementation uses only tinygrad Tensor operations, making it:
 - Device-agnostic (works on any tinygrad backend)
-- Compatible with TinyJit for kernel graph caching
 
 This is the portable fallback that trades some efficiency for compatibility.
 """
@@ -27,7 +26,6 @@ def paged_decode_attention_tinygrad(
     """Pure tinygrad paged attention.
 
     Uses only tinygrad Tensor operations for device-agnostic execution.
-    Compatible with TinyJit for kernel graph caching.
 
     Args:
         queries: [batch, 1, n_heads, head_dim]
@@ -131,7 +129,6 @@ def paged_decode_attention_from_lists(
     """Convenience wrapper that accepts Python lists.
 
     Converts lists to tensors and calls paged_decode_attention_tinygrad.
-    Use this for simple cases; use the tensor version directly for JIT.
     """
     batch_size = len(context_lens)
     max_blocks = max(len(bt) for bt in block_tables)
