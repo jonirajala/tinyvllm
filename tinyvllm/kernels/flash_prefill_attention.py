@@ -1,24 +1,24 @@
-"""Pure tinygrad Flash Attention implementation for prefill.
+"""Flash Attention for prefill phase.
 
-This implements Flash Attention using only tinygrad Tensor operations:
+Uses tinygrad Tensor operations for device-agnostic execution.
+Works on any tinygrad backend (Metal, CUDA, CPU, etc.)
+
+Features:
 - GQA support (n_kv_heads → n_heads)
 - Causal masking
-
-This is the portable fallback that works on any tinygrad backend.
-The Metal kernel provides optimized performance for Apple Silicon.
 """
 
 import math
 from tinygrad import Tensor, dtypes
 
 
-def flash_prefill_attention_tinygrad(
+def flash_prefill_attention(
     queries: Tensor,   # [1, q_len, n_heads, head_dim]
     keys: Tensor,      # [1, kv_len, n_kv_heads, head_dim]
     values: Tensor,    # [1, kv_len, n_kv_heads, head_dim]
     causal: bool = True,
 ) -> Tensor:
-    """Flash Attention for prefill.
+    """Flash Attention for prefill phase.
 
     Args:
         queries: [1, q_len, n_heads, head_dim]

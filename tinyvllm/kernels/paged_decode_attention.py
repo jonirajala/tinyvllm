@@ -1,31 +1,28 @@
-"""Pure tinygrad paged attention implementation.
+"""Paged attention for decode phase.
 
-Unlike the custom Metal/CUDA kernels which use device-specific APIs,
-this implementation uses only tinygrad Tensor operations, making it:
-- Device-agnostic (works on any tinygrad backend)
-
-This is the portable fallback that trades some efficiency for compatibility.
+Uses tinygrad Tensor operations for device-agnostic execution.
+Works on any tinygrad backend (Metal, CUDA, CPU, etc.)
 """
 
 import math
 from tinygrad import Tensor, dtypes
 
 
-def paged_decode_attention_tinygrad(
+def paged_decode_attention(
     queries: Tensor,        # [batch, 1, n_heads, head_dim]
     k_cache: Tensor,        # [num_blocks, block_size, n_kv_heads, head_dim]
     v_cache: Tensor,        # [num_blocks, block_size, n_kv_heads, head_dim]
-    block_tables: Tensor,   # [batch, max_blocks] int32 - TENSOR not list
-    context_lens: Tensor,   # [batch] int32 - TENSOR not list
+    block_tables: Tensor,   # [batch, max_blocks] int32
+    context_lens: Tensor,   # [batch] int32
     n_heads: int,
     n_kv_heads: int,
     head_dim: int,
     block_size: int,
-    max_context_len: int = None,  # Optional: limit reads to this context length
+    max_context_len: int = None,
 ) -> Tensor:
-    """Pure tinygrad paged attention.
+    """Paged attention for decode phase.
 
-    Uses only tinygrad Tensor operations for device-agnostic execution.
+    Gathers K/V from block-based cache and computes attention.
 
     Args:
         queries: [batch, 1, n_heads, head_dim]

@@ -8,10 +8,10 @@ import pytest
 import math
 from tinygrad import Tensor, dtypes
 
-from tinyvllm.kernels.flash_prefill_attention_tinygrad import flash_prefill_attention_tinygrad as _flash_kernel
+from tinyvllm.kernels import flash_prefill_attention as _flash_kernel
 
 
-def flash_prefill_attention_tinygrad(q, k, v, causal=True):
+def flash_prefill_attention(q, k, v, causal=True):
     """Wrapper that handles batch dimension for tests."""
     out = _flash_kernel(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), causal)
     return out.squeeze(0)
@@ -91,7 +91,7 @@ class TestFlashAttentionBasic:
         q = Tensor.randn(16, 8, 64)
         k = Tensor.randn(16, 8, 64)
         v = Tensor.randn(16, 8, 64)
-        out = flash_prefill_attention_tinygrad(q, k, v, causal=True)
+        out = flash_prefill_attention(q, k, v, causal=True)
         assert out.shape == (16, 8, 64)
 
     def test_matches_standard_attention_no_gqa(self):
@@ -99,7 +99,7 @@ class TestFlashAttentionBasic:
         k = Tensor.randn(32, 4, 32)
         v = Tensor.randn(32, 4, 32)
         std_out = standard_attention_with_gqa(q, k, v, causal=True)
-        flash_out = flash_prefill_attention_tinygrad(q, k, v, causal=True)
+        flash_out = flash_prefill_attention(q, k, v, causal=True)
         assert_allclose(flash_out, std_out, rtol=1e-4, atol=1e-4)
 
     def test_matches_standard_attention_with_gqa(self):
@@ -107,7 +107,7 @@ class TestFlashAttentionBasic:
         k = Tensor.randn(32, 8, 64)
         v = Tensor.randn(32, 8, 64)
         std_out = standard_attention_with_gqa(q, k, v, causal=True)
-        flash_out = flash_prefill_attention_tinygrad(q, k, v, causal=True)
+        flash_out = flash_prefill_attention(q, k, v, causal=True)
         assert_allclose(flash_out, std_out, rtol=1e-4, atol=1e-4)
 
     def test_non_causal(self):
@@ -115,7 +115,7 @@ class TestFlashAttentionBasic:
         k = Tensor.randn(16, 4, 32)
         v = Tensor.randn(16, 4, 32)
         std_out = _attention(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), mask=None).squeeze(0)
-        flash_out = flash_prefill_attention_tinygrad(q, k, v, causal=False)
+        flash_out = flash_prefill_attention(q, k, v, causal=False)
         assert_allclose(flash_out, std_out, rtol=1e-4, atol=1e-4)
 
 
@@ -126,14 +126,14 @@ class TestCausalMasking:
         q = Tensor([q_first] + [q_data] * 7)
         k = Tensor.randn(8, 2, 16)
         v = Tensor.eye(8).unsqueeze(1).expand(8, 2, 8)
-        out = flash_prefill_attention_tinygrad(q, k, v, causal=True)
+        out = flash_prefill_attention(q, k, v, causal=True)
         assert out[0, 0, 0].item() > 0.5
 
     def test_last_token_attends_to_all(self):
         q = Tensor.ones(8, 2, 16)
         k = Tensor.zeros(8, 2, 16)
         v = Tensor.arange(8).reshape(8, 1, 1).expand(8, 2, 16).float()
-        out = flash_prefill_attention_tinygrad(q, k, v, causal=True)
+        out = flash_prefill_attention(q, k, v, causal=True)
         last_token_out = out[-1, 0, 0].item()
         expected = sum(range(8)) / 8
         assert abs(last_token_out - expected) < 1e-2
@@ -145,7 +145,7 @@ class TestGQA:
         k = Tensor.randn(16, 4, 32)
         v = Tensor.randn(16, 4, 32)
         std_out = standard_attention_with_gqa(q, k, v, causal=True)
-        flash_out = flash_prefill_attention_tinygrad(q, k, v, causal=True)
+        flash_out = flash_prefill_attention(q, k, v, causal=True)
         assert_allclose(flash_out, std_out, rtol=1e-4, atol=1e-4)
 
     def test_gqa_4x(self):
@@ -153,7 +153,7 @@ class TestGQA:
         k = Tensor.randn(16, 8, 64)
         v = Tensor.randn(16, 8, 64)
         std_out = standard_attention_with_gqa(q, k, v, causal=True)
-        flash_out = flash_prefill_attention_tinygrad(q, k, v, causal=True)
+        flash_out = flash_prefill_attention(q, k, v, causal=True)
         assert_allclose(flash_out, std_out, rtol=1e-4, atol=1e-4)
 
     def test_gqa_8x(self):
@@ -161,7 +161,7 @@ class TestGQA:
         k = Tensor.randn(16, 4, 64)
         v = Tensor.randn(16, 4, 64)
         std_out = standard_attention_with_gqa(q, k, v, causal=True)
-        flash_out = flash_prefill_attention_tinygrad(q, k, v, causal=True)
+        flash_out = flash_prefill_attention(q, k, v, causal=True)
         assert_allclose(flash_out, std_out, rtol=1e-4, atol=1e-4)
 
 
@@ -172,7 +172,7 @@ class TestSequenceLengths:
         k = Tensor.randn(q_len, 4, 32)
         v = Tensor.randn(q_len, 4, 32)
         std_out = standard_attention_with_gqa(q, k, v, causal=True)
-        flash_out = flash_prefill_attention_tinygrad(q, k, v, causal=True)
+        flash_out = flash_prefill_attention(q, k, v, causal=True)
         assert_allclose(flash_out, std_out, rtol=1e-4, atol=1e-4)
 
     def test_single_token(self):
@@ -180,7 +180,7 @@ class TestSequenceLengths:
         k = Tensor.randn(1, 8, 64)
         v = Tensor.randn(1, 8, 64)
         std_out = standard_attention_with_gqa(q, k, v, causal=True)
-        flash_out = flash_prefill_attention_tinygrad(q, k, v, causal=True)
+        flash_out = flash_prefill_attention(q, k, v, causal=True)
         assert_allclose(flash_out, std_out, rtol=1e-4, atol=1e-4)
 
 
@@ -191,7 +191,7 @@ class TestHeadDimensions:
         k = Tensor.randn(16, 4, head_dim)
         v = Tensor.randn(16, 4, head_dim)
         std_out = standard_attention_with_gqa(q, k, v, causal=True)
-        flash_out = flash_prefill_attention_tinygrad(q, k, v, causal=True)
+        flash_out = flash_prefill_attention(q, k, v, causal=True)
         assert_allclose(flash_out, std_out, rtol=1e-4, atol=1e-4)
 
 
@@ -200,7 +200,7 @@ class TestDtypes:
         q = Tensor.randn(32, 4, 32, dtype=dtypes.float16)
         k = Tensor.randn(32, 4, 32, dtype=dtypes.float16)
         v = Tensor.randn(32, 4, 32, dtype=dtypes.float16)
-        out = flash_prefill_attention_tinygrad(q, k, v, causal=True)
+        out = flash_prefill_attention(q, k, v, causal=True)
         assert out.shape == (32, 4, 32)
         assert out.isnan().sum().item() == 0
         assert out.isinf().sum().item() == 0
@@ -209,7 +209,7 @@ class TestDtypes:
         q = Tensor.randn(32, 4, 32, dtype=dtypes.float32)
         k = Tensor.randn(32, 4, 32, dtype=dtypes.float32)
         v = Tensor.randn(32, 4, 32, dtype=dtypes.float32)
-        out = flash_prefill_attention_tinygrad(q, k, v, causal=True)
+        out = flash_prefill_attention(q, k, v, causal=True)
         assert out.dtype == dtypes.float32
         assert out.shape == (32, 4, 32)
 
@@ -220,7 +220,7 @@ class TestTinyLlamaConfig:
         k = Tensor.randn(64, 8, 64)
         v = Tensor.randn(64, 8, 64)
         std_out = standard_attention_with_gqa(q, k, v, causal=True)
-        flash_out = flash_prefill_attention_tinygrad(q, k, v, causal=True)
+        flash_out = flash_prefill_attention(q, k, v, causal=True)
         assert_allclose(flash_out, std_out, rtol=1e-4, atol=1e-4)
 
     def test_tinyllama_longer_context(self):
@@ -228,5 +228,5 @@ class TestTinyLlamaConfig:
         k = Tensor.randn(256, 8, 64)
         v = Tensor.randn(256, 8, 64)
         std_out = standard_attention_with_gqa(q, k, v, causal=True)
-        flash_out = flash_prefill_attention_tinygrad(q, k, v, causal=True)
+        flash_out = flash_prefill_attention(q, k, v, causal=True)
         assert_allclose(flash_out, std_out, rtol=1e-3, atol=1e-3)

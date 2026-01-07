@@ -8,9 +8,7 @@ from tinygrad.nn import Embedding, Linear
 from .weights import LlamaConfig
 from ..core.kv_cache import KVCache
 from ..core.block_manager import BlockManager
-from ..kernels import flash_prefill_attention
-from ..kernels import paged_decode_attention as paged_decode_attention_kernel
-from ..kernels import paged_decode_attention_tinygrad
+from ..kernels import flash_prefill_attention, paged_decode_attention
 
 
 
@@ -94,13 +92,10 @@ class Attention:
         layer_idx: int,
         seq_ids: List[int],
         start_positions: List[int],
-        block_tables_tensor: Tensor = None,
-        context_lens_tensor: Tensor = None,
     ) -> Tensor:
-        """Unified attention for both prefill and decode.
+        """Attention for prefill phase using flash attention.
 
-        Prefill (block_tables_tensor=None): Uses flash attention on fresh K/V.
-        Decode (block_tables_tensor provided): Uses paged attention from KV cache.
+        Note: Decode uses JIT-compiled path in Llama.decode() which bypasses this.
 
         Args:
             x: Input tensor [batch, seq_len, dim]
@@ -108,10 +103,8 @@ class Attention:
             kv_cache: KVCache instance
             block_manager: BlockManager for slot allocation
             layer_idx: Which transformer layer
-            seq_ids: List of sequence IDs (length 1 for prefill, batch for decode)
+            seq_ids: List of sequence IDs
             start_positions: Start position for each sequence
-            block_tables_tensor: [batch, max_blocks] for decode, None for prefill
-            context_lens_tensor: [batch] for decode, None for prefill
         """
         batch, seq_len, _ = x.shape
 
@@ -124,21 +117,12 @@ class Attention:
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
 
-        # Write K/V to cache (standard lazy writes - direct buffer writes didn't help)
+        # Write K/V to cache
         for i, (seq_id, start_pos) in enumerate(zip(seq_ids, start_positions)):
             self._write_kv_to_blocks(kv_cache, block_manager, layer_idx, seq_id, k[i], v[i], start_pos)
 
-        # Attention: flash for prefill, paged for decode
-        # Prefill: block_tables_tensor is None (use flash attention on fresh K/V)
-        # Decode: block_tables_tensor provided (use paged attention from cache)
-        if block_tables_tensor is None:
-            out = flash_prefill_attention(q, k, v, causal=True)
-        else:
-            k_cache, v_cache = kv_cache.get_cache_tensors(layer_idx)
-            out = paged_decode_attention_kernel(
-                q, k_cache, v_cache, block_tables_tensor, context_lens_tensor,
-                self.n_heads, kv_cache.n_kv_heads, self.head_dim, kv_cache.block_size
-            )
+        # Flash attention for prefill
+        out = flash_prefill_attention(q, k, v, causal=True)
 
         return self.wo(out.reshape(batch, seq_len, -1))
 
@@ -225,14 +209,14 @@ class TransformerBlock:
         layer_idx: int,
         seq_ids: List[int],
         start_positions: List[int],
-        block_tables_tensor: Tensor = None,
-        context_lens_tensor: Tensor = None,
     ) -> Tensor:
-        """Forward pass through transformer block (prefill or decode)."""
+        """Forward pass through transformer block (prefill only).
+
+        Note: Decode uses JIT-compiled path in Llama.decode() which bypasses this.
+        """
         h = self.attention(
             self.attention_norm(x), cos, sin, kv_cache, block_manager,
-            layer_idx, seq_ids, start_positions,
-            block_tables_tensor, context_lens_tensor
+            layer_idx, seq_ids, start_positions
         )
         x = x + h
         return x + self.feed_forward(self.ffn_norm(x))
@@ -298,48 +282,6 @@ class Llama:
 
         return self.output(self.norm(h))
 
-    def decode(
-        self,
-        tokens: Tensor,
-        kv_cache: KVCache,
-        block_manager: BlockManager,
-        seq_ids: List[int],
-        start_positions: List[int],
-        block_tables_tensor: Tensor,
-        context_lens_tensor: Tensor,
-    ) -> Tensor:
-        """Decode: batched single-token generation.
-
-        Args:
-            tokens: Input token IDs [batch, 1] - one token per sequence
-            kv_cache: KVCache instance
-            block_manager: BlockManager for slot allocation
-            seq_ids: List of sequence IDs
-            start_positions: Start position for each sequence
-            block_tables_tensor: [batch, max_blocks] int32
-            context_lens_tensor: [batch] int32
-
-        Returns:
-            logits: Output logits [batch, 1, vocab_size]
-        """
-        batch, seq_len = tokens.shape
-        assert seq_len == 1, "Decode only for single token per sequence"
-
-        h = self.tok_embeddings(tokens)
-
-        # Gather RoPE for each sequence's actual position
-        cos = self.cos[start_positions].unsqueeze(1)  # [batch, 1, head_dim/2]
-        sin = self.sin[start_positions].unsqueeze(1)
-
-        for layer_idx, layer in enumerate(self.layers):
-            h = layer(h, cos, sin, kv_cache, block_manager, layer_idx,
-                      seq_ids, start_positions, block_tables_tensor, context_lens_tensor)
-
-        for seq_id in seq_ids:
-            block_manager.advance_position(seq_id)
-
-        return self.output(self.norm(h))
-
     def _create_jit_decode_forward(self, max_blocks: int = 64):
         """Create the JIT-compiled decode forward function.
 
@@ -399,8 +341,8 @@ class Llama:
                 k_outputs.append(k.squeeze(1))  # [batch, n_kv_heads, head_dim]
                 v_outputs.append(v.squeeze(1))
 
-                # Paged attention from cache (pure tinygrad for JIT compatibility)
-                attn_out = paged_decode_attention_tinygrad(
+                # Paged attention from cache
+                attn_out = paged_decode_attention(
                     q, k_caches[layer_idx], v_caches[layer_idx],
                     block_tables, context_lens,
                     config.n_heads, config.n_kv_heads, config.head_dim, block_size
@@ -424,7 +366,7 @@ class Llama:
 
         return jit_decode_forward
 
-    def decode_jit(
+    def decode(
         self,
         tokens: Tensor,
         kv_cache: KVCache,
@@ -434,13 +376,13 @@ class Llama:
         block_tables_tensor: Tensor,
         context_lens_tensor: Tensor,
     ) -> Tensor:
-        """JIT-optimized decode: 4-5x faster than standard decode.
+        """Decode: batched single-token generation with JIT optimization.
 
-        Uses TinyJit to eliminate scheduling overhead. KV cache writes
-        happen outside the JIT function.
+        Uses TinyJit to cache the computation graph, eliminating scheduling
+        overhead for ~4x speedup. KV cache writes happen outside the JIT.
 
         Args:
-            tokens: Input token IDs [batch, 1]
+            tokens: Input token IDs [batch, 1] - one token per sequence
             kv_cache: KVCache instance
             block_manager: BlockManager for slot allocation
             seq_ids: List of sequence IDs
