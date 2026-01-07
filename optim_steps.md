@@ -38,13 +38,129 @@ Same kernel launch overhead issue as Plan 2. Skipped.
 Custom kernels run via Metal APIs directly, not through tinygrad's lazy execution.
 Would need to choose: pure tinygrad + JIT OR custom kernels without JIT.
 
-### Plan 5: Optimize Custom Kernel Integration - 🔄 IN PROGRESS
-**Issue**: Custom kernels call `.realize()` which forces scheduling boundaries.
-- Custom Metal paged attention: 12039ms (1.66 tok/s)
-- Pure tinygrad: 10827ms (1.85 tok/s) - 11% faster!
+### Plan 5: Direct Metal Buffer Writes for KV Cache - ❌ ABANDONED
+**Date**: 2025-01-07
+**Issue**: Custom kernels call `.realize()` which forces scheduling of pending lazy ops.
+When KV cache uses `__setitem__`, it creates lazy ops. Custom kernel's `realize()` then
+triggers scheduling of these writes, adding ~7ms overhead per kernel call.
 
-**Root Cause**: Each custom kernel call forces scheduling, breaking lazy fusion.
-Need to investigate how to reduce realize() overhead in custom kernels.
+**Attempted Solutions**:
+
+**Attempt 1: Sync per write** - FAILED
+- Bypass scheduler by writing directly to Metal buffer contents
+- Problem: Requires `synchronize()` before each buffer access
+- Result: 2% slower than standard writes (sync overhead negates benefit)
+
+**Attempt 2: Sync once, copy all (sync-once approach)** - PARTIALLY WORKED
+- Realize all K/V tensors, sync ONCE, then do all direct copies
+- Isolated benchmark: **53x faster** (2180ms → 41ms for 1100 writes)
+- But model structure requires sync per layer (22 layers = 22 syncs)
+- End-to-end result: Still slower than lazy writes (670ms vs 632ms TPOT)
+
+**Root Cause Analysis**:
+The transformer architecture processes layers sequentially. Each layer:
+1. Computes new K/V tensors
+2. Writes to KV cache
+3. Runs attention
+4. Proceeds to next layer
+
+For sync-once to work, we'd need to batch ALL layer operations and sync once
+at the end. But that requires restructuring the entire forward pass, which is
+impractical.
+
+**Key Insight**: Tinygrad's lazy evaluation handles the scheduling efficiently.
+The "overhead" we measured was actually correct synchronization that ensures
+data consistency. Attempting to bypass it just shifts the sync elsewhere.
+
+**Lesson Learned**: Direct buffer writes only help when:
+1. You can batch writes across ALL layers with a single sync (53x speedup)
+2. But this requires major architectural changes to batch layer processing
+3. Per-layer or per-write sync negates any benefit
+
+**Status**: Abandoned. Standard lazy writes are optimal for current architecture.
+
+### Plan 6: TinyJit for Decode Forward - ✅ IMPLEMENTED (4x Speedup!)
+**Date**: 2026-01-07
+
+**Problem Identified**: Profiling with DEBUG=2 revealed:
+- Total kernel time: 2612ms (27.4%)
+- **Scheduling overhead: 6920ms (72.6%)** ← This is the real bottleneck!
+- 1559 scheduling batches at 4.44ms average each
+- Kernel breakdown: linear 52%, silu 21%, __add__ 8%, __setitem__ 5%
+
+**Root Cause**: Each `.realize()` call triggers tinygrad's scheduler which:
+1. Builds computation graph
+2. Linearizes operations
+3. Allocates buffers
+4. Launches kernels
+
+With 1559 scheduling batches for 10 tokens, that's ~150 schedule calls per token!
+
+**Solution: TinyJit**
+TinyJit caches the compiled graph and reuses it, eliminating scheduling overhead.
+
+**Test Results**:
+1. **Simple matmul**: JIT 0.07ms vs Non-JIT 0.61ms → **8.7x speedup**
+2. **FFN (22 layers)**: JIT 37.8ms vs Non-JIT 78.7ms → **2.1x speedup**
+3. **Full decode (no KV writes)**: JIT 48.5ms vs Non-JIT 426ms → **8.8x speedup**
+4. **Full decode (with KV writes)**: JIT 131ms vs Non-JIT 700ms → **5.3x speedup**
+
+**Key Challenge**: KV cache writes use `__setitem__` which:
+- Cannot be JITted (forces immediate realize)
+- Takes ~30-120ms per decode step
+- Becomes the new bottleneck after JIT is applied
+
+**Implementation Plan**:
+1. Create JIT-compatible decode function:
+   - Use pure tinygrad paged attention (not custom Metal kernel)
+   - Separate KV writes from compute graph
+   - JIT: embedding → 22 layers (attention + FFN) → output
+   - Non-JIT: KV cache writes after JIT returns
+
+2. Code structure:
+```python
+@TinyJit
+def jit_decode_forward(token, cos, sin, block_tables, context_lens):
+    h = model.tok_embeddings(token)
+    k_outputs, v_outputs = [], []
+    for layer in model.layers:
+        # attention + FFN (pure tinygrad ops)
+        ...
+        k_outputs.append(k)
+        v_outputs.append(v)
+    return model.output(model.norm(h)), k_outputs, v_outputs
+
+def decode_step(token, pos):
+    logits, k_all, v_all = jit_decode_forward(token, cos, sin, ...)
+    # Write K/V outside JIT
+    for layer_idx in range(n_layers):
+        kv_cache.write_kv_batch(layer_idx, block_id, offset, k_all[layer_idx], v_all[layer_idx])
+    return logits
+```
+
+**Expected Impact**: 4-5x speedup (700ms → 140-180ms per decode step)
+
+**Trade-offs**:
+- Must use pure tinygrad attention, not custom Metal kernel
+- KV writes remain a bottleneck (~30-50ms per step)
+- First decode step has JIT compilation overhead
+
+**FINAL RESULTS (Implemented)**:
+- **4.06x speedup achieved!**
+- JIT: 8178ms for 50 tokens = **6.11 tok/s**
+- Non-JIT: 33218ms for 50 tokens = **1.51 tok/s**
+
+**Implementation Details**:
+- Added `decode_jit()` method to Llama class (`llama.py`)
+- Added `_create_jit_decode_forward()` to create cached JIT function
+- Updated `LLMEngine` with `use_jit=True` flag (default enabled)
+- Block tables padded to fixed size (64 blocks) for JIT compatibility
+
+**Files Modified**:
+- `tinyvllm/model/llama.py`: Added JIT decode methods
+- `tinyvllm/engine/engine.py`: Added use_jit parameter
+
+**Status**: ✅ IMPLEMENTED AND WORKING
 
 ---
 

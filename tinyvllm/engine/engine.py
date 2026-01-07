@@ -106,6 +106,7 @@ class LLMEngine:
         num_scheduler_steps: int = 1,
         async_output: bool = False,
         output_callback: Optional[Callable[[GenerationOutput], None]] = None,
+        use_jit: bool = True,
     ):
         """
         Initialize the engine.
@@ -122,12 +123,15 @@ class LLMEngine:
                 Detokenize on background thread while GPU computes next step
             output_callback: Callback for async outputs (requires async_output=True)
                 If None, use poll_outputs() to retrieve results
+            use_jit: Enable TinyJit for decode (4-5x speedup, default True)
+                Uses pure tinygrad attention instead of custom Metal kernels.
         """
         self.model = model
         self.tokenizer = tokenizer
         self.max_batch_size = max_batch_size
         self.block_size = block_size
         self.num_scheduler_steps = num_scheduler_steps
+        self.use_jit = use_jit
 
         # Phase 4: Create BlockManager for memory allocation
         self.block_manager = BlockManager(
@@ -267,15 +271,28 @@ class LLMEngine:
 
             # Batched forward pass
             input_ids = Tensor(tokens_list).reshape(len(decode_seqs), 1)
-            logits = self.model.decode(
-                input_ids,
-                kv_cache=self.kv_cache,
-                block_manager=self.block_manager,
-                seq_ids=seq_ids,
-                start_positions=start_positions,
-                block_tables_tensor=bt_tensor,
-                context_lens_tensor=ctx_tensor,
-            )
+            if self.use_jit:
+                # JIT decode: 4-5x faster, uses pure tinygrad attention
+                logits = self.model.decode_jit(
+                    input_ids,
+                    kv_cache=self.kv_cache,
+                    block_manager=self.block_manager,
+                    seq_ids=seq_ids,
+                    start_positions=start_positions,
+                    block_tables_tensor=bt_tensor,
+                    context_lens_tensor=ctx_tensor,
+                )
+            else:
+                # Standard decode: uses custom Metal kernels
+                logits = self.model.decode(
+                    input_ids,
+                    kv_cache=self.kv_cache,
+                    block_manager=self.block_manager,
+                    seq_ids=seq_ids,
+                    start_positions=start_positions,
+                    block_tables_tensor=bt_tensor,
+                    context_lens_tensor=ctx_tensor,
+                )
 
             # Sample tokens for entire batch at once
             batch_logits = logits[:, 0, :]  # [batch, vocab_size]
