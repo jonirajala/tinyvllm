@@ -38,17 +38,19 @@ Or step-by-step:
 """
 
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, Iterator, List, Optional, Tuple
 
 from tinygrad import Tensor, dtypes
 
-from ..model.llama import Llama
-from ..core.scheduler import Scheduler
-from ..core.sequence import Request, Sequence
-from ..core.block_manager import BlockManager
-from ..core.kv_cache import KVCache
-from ..engine.sampling import SamplingParams, sample_tokens
-from ..engine.output_processor import OutputProcessor
+from .scheduler import Scheduler
+from .sequence import Request, Sequence
+from .block_manager import BlockManager
+from .kv_cache import KVCache
+from .sampling import SamplingParams, sample_tokens
+from .output_processor import OutputProcessor
+
+if TYPE_CHECKING:
+    from ..model.llama import Llama
 
 
 @dataclass
@@ -98,7 +100,7 @@ class LLMEngine:
 
     def __init__(
         self,
-        model: Llama,
+        model: "Llama",
         tokenizer,
         max_batch_size: int = 8,
         num_blocks: int = 100,
@@ -160,7 +162,9 @@ class LLMEngine:
             callback=output_callback,
         )
 
-
+        # JIT decode function (per-engine caching for determinism)
+        self._jit_decode_fn = model.create_jit_decode(block_size=block_size)
+        self._jit_max_blocks = 64  # Max blocks for JIT padding
 
     def add_request(
         self,
@@ -275,6 +279,8 @@ class LLMEngine:
                 start_positions=start_positions,
                 block_tables_tensor=bt_tensor,
                 context_lens_tensor=ctx_tensor,
+                jit_fn=self._jit_decode_fn,
+                max_blocks=self._jit_max_blocks,
             )
 
             # Sample tokens for entire batch at once

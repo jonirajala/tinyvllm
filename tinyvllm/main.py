@@ -14,8 +14,8 @@ from tinygrad import Device
 from tinyvllm.model.llama import create_llama
 from tinyvllm.model.weights import load_llama_weights
 from tinyvllm.model.tokenizer import load_tokenizer
-from tinyvllm.engine.sampling import SamplingParams
-from tinyvllm.engine.engine import LLMEngine
+from tinyvllm.core.sampling import SamplingParams
+from tinyvllm.core.engine import LLMEngine
 
 
 def main():

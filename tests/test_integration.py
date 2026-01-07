@@ -5,8 +5,8 @@ from tinygrad import Tensor, dtypes
 
 from tinyvllm.model.llama import Llama, create_llama
 from tinyvllm.model.weights import LlamaConfig
-from tinyvllm.engine.sampling import SamplingParams
-from tinyvllm.engine.engine import LLMEngine, generate_batch
+from tinyvllm.core.sampling import SamplingParams
+from tinyvllm.core.engine import LLMEngine, generate_batch
 
 
 # Small config for fast tests

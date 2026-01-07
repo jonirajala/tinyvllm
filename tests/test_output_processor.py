@@ -5,7 +5,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from tinyvllm.engine.output_processor import OutputProcessor, PendingOutput
+from tinyvllm.core.output_processor import OutputProcessor, PendingOutput
 
 
 class MockTokenizer:

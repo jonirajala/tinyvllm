@@ -3,7 +3,7 @@
 import pytest
 from tinygrad import Tensor
 
-from tinyvllm.engine.sampling import (
+from tinyvllm.core.sampling import (
     SamplingParams,
     sample_tokens,
     _top_k_filter,

@@ -8,7 +8,7 @@ import pytest
 import math
 from tinygrad import Tensor, dtypes
 
-from tinyvllm.kernels import flash_prefill_attention as _flash_kernel
+from tinyvllm.model.llama import flash_prefill_attention as _flash_kernel
 
 
 def flash_prefill_attention(q, k, v, causal=True):

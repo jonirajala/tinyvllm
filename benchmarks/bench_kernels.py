@@ -151,8 +151,8 @@ def bench_flash_prefill_attention(
 def bench_full_forward_batch(model, tokenizer, config, batch_size: int = 1, num_tokens: int = 20, use_metal: bool = True) -> Tuple[float, float]:
     """Benchmark full model forward pass with batching, return (prefill_ms, decode_ms_per_step)."""
     import tinyvllm.kernels as kernels
-    from tinyvllm.engine.engine import LLMEngine
-    from tinyvllm.engine.sampling import SamplingParams
+    from tinyvllm.core.engine import LLMEngine
+    from tinyvllm.core.sampling import SamplingParams
 
     # Force kernel selection by overriding the dispatcher's cached kernel
     if use_metal:

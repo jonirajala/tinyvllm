@@ -4,7 +4,7 @@ import pytest
 
 from tinyvllm.core.scheduler import Scheduler
 from tinyvllm.core.sequence import Request, Sequence, SequenceStatus, SchedulerOutput
-from tinyvllm.engine.sampling import SamplingParams
+from tinyvllm.core.sampling import SamplingParams
 
 
 def make_request(request_id: int, prompt_tokens=None) -> Request:

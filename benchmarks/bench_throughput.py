@@ -23,8 +23,8 @@ if "DEVICE" in os.environ:
 from tinyvllm.model.llama import Llama, create_llama
 from tinyvllm.model.weights import LlamaConfig, load_llama_weights
 from tinyvllm.model.tokenizer import load_tokenizer
-from tinyvllm.engine.sampling import SamplingParams
-from tinyvllm.engine.engine import LLMEngine
+from tinyvllm.core.sampling import SamplingParams
+from tinyvllm.core.engine import LLMEngine
 from benchmarks.gpu_specs import get_gpu_specs, TheoreticalLimits, GPUSpecs
 
 

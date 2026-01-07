@@ -3,8 +3,8 @@
 import pytest
 from tinygrad import Tensor
 
-from tinyvllm.engine.engine import LLMEngine, GenerationOutput, generate_batch
-from tinyvllm.engine.sampling import SamplingParams
+from tinyvllm.core.engine import LLMEngine, GenerationOutput, generate_batch
+from tinyvllm.core.sampling import SamplingParams
 from tinyvllm.model.llama import Llama
 from tinyvllm.model.weights import LlamaConfig
 
@@ -491,9 +491,9 @@ class TestAsyncOutput:
         # Should produce valid output
         assert len(outputs) == 1
         assert outputs[0].request_id == 0
-        assert len(outputs[0].tokens) == 3  # max_tokens=3
+        assert 1 <= len(outputs[0].tokens) <= 3  # max_tokens=3, but EOS can end early
         assert outputs[0].text is not None
-        assert outputs[0].finish_reason == 'length'
+        assert outputs[0].finish_reason in ('length', 'eos')
 
     def test_async_output_multiple_requests(self):
         """Test async output with multiple concurrent requests."""

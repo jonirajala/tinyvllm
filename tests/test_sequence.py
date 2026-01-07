@@ -4,7 +4,7 @@ import pytest
 import time
 
 from tinyvllm.core.sequence import Sequence, Request, SequenceStatus, SchedulerOutput
-from tinyvllm.engine.sampling import SamplingParams
+from tinyvllm.core.sampling import SamplingParams
 
 
 class TestSequence:

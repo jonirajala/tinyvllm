@@ -204,7 +204,7 @@ def benchmark_inference_breakdown(
     """
     from tinyvllm.core.kv_cache import KVCache
     from tinyvllm.core.block_manager import BlockManager
-    from tinyvllm.engine.sampling import SamplingParams, sample_tokens
+    from tinyvllm.core.sampling import SamplingParams, sample_tokens
 
     profiler = BreakdownProfiler()
 

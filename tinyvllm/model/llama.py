@@ -1,5 +1,6 @@
 """LLaMA model implementation using tinygrad."""
 
+import math
 from typing import Dict, List, Optional, Tuple
 
 from tinygrad import Tensor, dtypes, TinyJit
@@ -8,7 +9,6 @@ from tinygrad.nn import Embedding, Linear
 from .weights import LlamaConfig
 from ..core.kv_cache import KVCache
 from ..core.block_manager import BlockManager
-from ..kernels import flash_prefill_attention, paged_decode_attention
 
 
 
@@ -66,6 +66,100 @@ def apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     # Interleave back
     out = Tensor.stack([out0, out1], dim=-1).reshape(batch, seq, heads, head_dim)
     return out
+
+
+def flash_prefill_attention(
+    queries: Tensor,   # [1, q_len, n_heads, head_dim]
+    keys: Tensor,      # [1, kv_len, n_kv_heads, head_dim]
+    values: Tensor,    # [1, kv_len, n_kv_heads, head_dim]
+    causal: bool = True,
+) -> Tensor:
+    """Flash Attention for prefill phase."""
+    queries = queries.squeeze(0)  # [q_len, n_heads, head_dim]
+    keys = keys.squeeze(0)        # [kv_len, n_kv_heads, head_dim]
+    values = values.squeeze(0)    # [kv_len, n_kv_heads, head_dim]
+
+    q_len, n_heads, head_dim = queries.shape
+    kv_len, n_kv_heads, _ = keys.shape
+    scale = 1.0 / math.sqrt(head_dim)
+
+    # Handle GQA: expand KV heads to match Q heads
+    if n_kv_heads != n_heads:
+        n_rep = n_heads // n_kv_heads
+        keys = keys.unsqueeze(2).expand(kv_len, n_kv_heads, n_rep, head_dim).reshape(kv_len, n_heads, head_dim)
+        values = values.unsqueeze(2).expand(kv_len, n_kv_heads, n_rep, head_dim).reshape(kv_len, n_heads, head_dim)
+
+    # Transpose for batched matmul: [n_heads, seq_len, head_dim]
+    q = queries.transpose(0, 1)
+    k = keys.transpose(0, 1)
+    v = values.transpose(0, 1)
+
+    # Compute attention scores (realize breaks lazy graph to avoid tinygrad TC optimizer bug)
+    scores = ((q @ k.transpose(-2, -1)) * scale).realize()
+
+    # Apply causal mask
+    if causal:
+        q_positions = Tensor.arange(q_len).reshape(q_len, 1)
+        kv_positions = Tensor.arange(kv_len).reshape(1, kv_len)
+        mask = (kv_positions > q_positions).cast(dtypes.float32) * (-1e9)
+        scores = scores + mask.unsqueeze(0)
+
+    attn_weights = scores.softmax(axis=-1)
+    output = attn_weights @ v
+    return output.transpose(0, 1).unsqueeze(0)
+
+
+def paged_decode_attention(
+    queries: Tensor,        # [batch, 1, n_heads, head_dim]
+    k_cache: Tensor,        # [num_blocks, block_size, n_kv_heads, head_dim]
+    v_cache: Tensor,        # [num_blocks, block_size, n_kv_heads, head_dim]
+    block_tables: Tensor,   # [batch, max_blocks] int32
+    context_lens: Tensor,   # [batch] int32
+    n_heads: int,
+    n_kv_heads: int,
+    head_dim: int,
+    block_size: int,
+    max_context_len: int = None,
+) -> Tensor:
+    """Paged attention for decode phase. Gathers K/V from block-based cache."""
+    batch_size = queries.shape[0]
+    total_max_blocks = block_tables.shape[1]
+
+    if max_context_len is not None:
+        blocks_needed = min((max_context_len + block_size - 1) // block_size, total_max_blocks)
+        max_context = blocks_needed * block_size
+        block_tables = block_tables[:, :blocks_needed]
+    else:
+        max_context = total_max_blocks * block_size
+
+    # Gather K/V blocks
+    block_indices = block_tables.flatten()
+    k_gathered = k_cache[block_indices].reshape(batch_size, max_context, n_kv_heads, head_dim)
+    v_gathered = v_cache[block_indices].reshape(batch_size, max_context, n_kv_heads, head_dim)
+
+    # Handle GQA
+    if n_kv_heads != n_heads:
+        n_rep = n_heads // n_kv_heads
+        k_gathered = k_gathered.unsqueeze(3).expand(batch_size, max_context, n_kv_heads, n_rep, head_dim).reshape(batch_size, max_context, n_heads, head_dim)
+        v_gathered = v_gathered.unsqueeze(3).expand(batch_size, max_context, n_kv_heads, n_rep, head_dim).reshape(batch_size, max_context, n_heads, head_dim)
+
+    # Attention
+    q = queries.transpose(1, 2)  # [batch, n_heads, 1, head_dim]
+    k = k_gathered.transpose(1, 2)
+    v = v_gathered.transpose(1, 2)
+
+    scale = 1.0 / math.sqrt(head_dim)
+    scores = (q @ k.transpose(-2, -1)) * scale
+
+    # Mask based on context_lens
+    positions = Tensor.arange(max_context).reshape(1, max_context)
+    valid_mask = (positions < context_lens.reshape(batch_size, 1)).cast(dtypes.float32)
+    attn_mask = (1.0 - valid_mask) * (-1e9)
+    scores = scores + attn_mask.reshape(batch_size, 1, 1, max_context)
+
+    attn_weights = scores.softmax(axis=-1)
+    output = attn_weights @ v
+    return output.transpose(1, 2)
 
 
 class Attention:
@@ -282,24 +376,23 @@ class Llama:
 
         return self.output(self.norm(h))
 
-    def _create_jit_decode_forward(self, max_blocks: int = 64):
-        """Create the JIT-compiled decode forward function.
+    def create_jit_decode(self, block_size: int = 16):
+        """Create a NEW JIT-compiled decode function.
 
-        This is called once to create the JIT function, which is then cached.
-        The JIT function does the full forward pass without KV cache writes,
-        returning logits and all K/V tensors for later cache updates.
+        Each call creates a fresh JIT function - caller should cache it.
+        Used by LLMEngine to have per-engine JIT caching.
 
         Args:
-            max_blocks: Maximum number of blocks per sequence (for fixed tensor shape).
-                        Default 64 = 1024 tokens at block_size=16.
+            block_size: Tokens per block (must match block_manager)
+
+        Returns:
+            JIT-compiled decode forward function
         """
         config = self.config
         layers = self.layers
         tok_embeddings = self.tok_embeddings
         norm = self.norm
         output = self.output
-        block_size = 16  # Must match block_manager.block_size
-        self._jit_max_blocks = max_blocks
 
         @TinyJit
         def jit_decode_forward(
@@ -375,11 +468,10 @@ class Llama:
         start_positions: List[int],
         block_tables_tensor: Tensor,
         context_lens_tensor: Tensor,
+        jit_fn,
+        max_blocks: int = 64,
     ) -> Tensor:
         """Decode: batched single-token generation with JIT optimization.
-
-        Uses TinyJit to cache the computation graph, eliminating scheduling
-        overhead for ~4x speedup. KV cache writes happen outside the JIT.
 
         Args:
             tokens: Input token IDs [batch, 1] - one token per sequence
@@ -389,38 +481,33 @@ class Llama:
             start_positions: Start position for each sequence
             block_tables_tensor: [batch, max_blocks] int32
             context_lens_tensor: [batch] int32
+            jit_fn: JIT-compiled forward function (from create_jit_decode)
+            max_blocks: Max blocks for padding (must match jit_fn creation)
 
         Returns:
             logits: Output logits [batch, 1, vocab_size]
         """
         batch = tokens.shape[0]
 
-        # Create JIT function on first call
-        if not hasattr(self, '_jit_decode_forward'):
-            self._jit_decode_forward = self._create_jit_decode_forward()
-
         # Gather RoPE for each sequence's position
         pos_tensor = Tensor(start_positions)
         cos = self.cos[pos_tensor].unsqueeze(1)  # [batch, 1, head_dim/2]
         sin = self.sin[pos_tensor].unsqueeze(1)
 
-        # Get cache tensors (already realized)
+        # Get cache tensors
         k_caches = [kv_cache.k_cache[i] for i in range(self.config.n_layers)]
         v_caches = [kv_cache.v_cache[i] for i in range(self.config.n_layers)]
 
         # Pad block_tables to fixed size for JIT compatibility
-        # JIT requires fixed tensor shapes across calls
-        max_blocks = self._jit_max_blocks
         current_blocks = block_tables_tensor.shape[1]
         if current_blocks < max_blocks:
-            # Pad with zeros
             padding = Tensor.zeros(batch, max_blocks - current_blocks, dtype=dtypes.int32)
             block_tables_padded = block_tables_tensor.cat(padding, dim=1)
         else:
             block_tables_padded = block_tables_tensor[:, :max_blocks]
 
         # JIT forward pass
-        logits, k_all, v_all = self._jit_decode_forward(
+        logits, k_all, v_all = jit_fn(
             tokens, cos, sin, k_caches, v_caches,
             block_tables_padded, context_lens_tensor
         )
