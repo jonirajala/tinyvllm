@@ -1,6 +1,6 @@
-"""Custom kernels for paged attention and flash attention.
+"""Custom kernels for paged attention, flash attention, and fused ops.
 
-- Metal: Custom Metal kernel with online softmax
+- Metal: Custom Metal kernels with optimizations
 - Other: Pure tinygrad fallback (device-agnostic)
 
 Paged Attention: For decode phase (reading from block-based KV cache)

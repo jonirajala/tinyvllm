@@ -21,7 +21,6 @@ class RMSNorm:
         self.weight = Tensor.ones(dim)
 
     def __call__(self, x: Tensor) -> Tensor:
-        # RMSNorm: x * rsqrt(mean(x^2) + eps) * weight
         rms = (x.pow(2).mean(-1, keepdim=True) + self.eps).rsqrt()
         return x * rms * self.weight
 
@@ -152,15 +151,25 @@ class Attention:
         v: Tensor,
         start_pos: int,
     ) -> None:
-        """Write K/V to block-based cache."""
+        """Write K/V to block-based cache using batched writes.
+
+        Optimization: Instead of writing token-by-token (N kernel launches),
+        we group contiguous tokens by block and use slice assignment
+        (1 kernel launch per block).
+        """
         seq_len = k.shape[0]
         block_size = block_manager.block_size
         block_table = block_manager.get_block_table(seq_id)
 
-        for i in range(seq_len):
-            pos = start_pos + i
+        token_idx = 0
+        pos = start_pos
+
+        while token_idx < seq_len:
             block_idx = pos // block_size
             offset = pos % block_size
+
+            # How many tokens fit in this block from current offset?
+            tokens_in_block = min(block_size - offset, seq_len - token_idx)
 
             # Allocate new block if needed (only in first layer)
             if block_idx >= len(block_table) and layer_idx == 0:
@@ -173,7 +182,14 @@ class Attention:
                 block_table = block_manager.get_block_table(seq_id)
 
             block_id = block_table[block_idx]
-            kv_cache.write_kv(layer_idx, block_id, offset, k[i], v[i])
+
+            # Batch write all tokens that go into this block
+            k_batch = k[token_idx:token_idx + tokens_in_block]
+            v_batch = v[token_idx:token_idx + tokens_in_block]
+            kv_cache.write_kv_batch(layer_idx, block_id, offset, k_batch, v_batch)
+
+            token_idx += tokens_in_block
+            pos += tokens_in_block
 
 
 class FeedForward:
