@@ -2,7 +2,7 @@
 # tinyvllm Implementation Roadmap (Priority-Ordered)
 
 **Current Status:** 1.7 tok/s single / 3.6 tok/s batched vs 55 tok/s theoretical (6.6% utilization)
-**Progress:** Phase 7 complete (+42% single, +33% batched vs Phase 6.2)
+**Progress:** Phase 8.1 complete (Flash Attention: 1.4-2.2x prefill speedup)
 **Primary Bottleneck:** Python→GPU scheduling overhead, NOT kernel speed
 
 ---
@@ -163,65 +163,131 @@
 
 ## Phase 8: Performance Tuning (30-50% additional)
 
-8.1 Pre-allocated Buffers
+8.1 Flash Attention for Prefill ✅
+**Impact:** 1.4-2.2x prefill speedup | **Status:** Completed
+**Prerequisite:** Online softmax ✅ (completed in 6.3)
+- Tiled attention with online softmax for prefill phase
+- Process Q, K, V in 8x8 tiles
+- Custom Metal kernel with threadgroup memory for tile storage
+- O(1) memory regardless of sequence length (vs O(n²))
+- Enables longer context windows (16K+)
+- **Benchmark results (isolated attention):**
+  - 32 tokens: 1.59x speedup (2.76ms → 1.73ms)
+  - 64 tokens: 1.46x speedup (2.79ms → 1.92ms)
+  - 128 tokens: 1.39x speedup (2.74ms → 1.97ms)
+  - 256 tokens: 2.22x speedup (4.16ms → 1.87ms)
+  - 512 tokens: 1.62x speedup (3.07ms → 1.89ms)
+- **Files:** `kernels/flash_attention_metal.py`, `kernels/flash_attention_tinygrad.py`, `attention_utils.py`
+- **Features:** GQA support, causal masking, auto-selects Metal or tinygrad fallback
+
+8.2 Pre-allocated Buffers
 **Impact:** 10-20% | **Status:** Not started
 - Pre-allocate decode input/output buffers at engine init
 - Reuse instead of Tensor.zeros() each step
 - Note: Works best combined with TinyJit (7.1)
 
-8.2 Async Output Processing
+8.3 Async Output Processing
 **Impact:** 8-10% | **Status:** Not started
 - Detokenize previous step while GPU computes current step ← overlap CPU/GPU
 - Background thread with queue for pending outputs
 - Return results via callback or poll
 
-8.3 Object Pooling (CPU)
+8.4 Object Pooling (CPU)
 **Impact:** 10-15% | **Status:** Not started
 - Pre-allocate Request, Sequence, SchedulerOutput objects
 - Reuse instead of alloc/free each step ← vLLM saw 24% improvement
 - Add .reset() method to clear state
 
-8.4 Weight Quantization INT4
-**Impact:** 2x more (4x total vs FP16) | **Status:** Not started
+8.5 Weight Quantization INT4 ❌
+**Impact:** 2x more (4x total vs FP16) | **Status:** Won't work (same issue as INT8)
+- Same problem as INT8: custom kernels can't integrate with tinygrad lazy graph
+- Each layer needs realize() calls that kill performance
+- Would need native tinygrad INT4 support
 - Per-group scales (group_size=128 typical)
 - GPTQ/AWQ style quantization
-- Requires calibration dataset
-- Slight quality loss (~1-3% perplexity)
 
-8.5 Sampling Optimizations
-**Impact:** 10-20% | **Status:** Not started
-- Remove .realize().tolist() sync points ← easy, high impact
+8.6 Sampling Optimizations
+**Impact:** 5-10% remaining | **Status:** Partially done
+- ✅ Top-k/top-p moved to CPU (faster than tinygrad's GPU topk which uses O(n log² n) bitonic sort)
+- Greedy fast path could help slightly
 - Batched sampling across sequences (currently single token at a time)
-- Top-p/top-k on GPU (currently converts to CPU list)
-- Fast path for greedy sampling (direct argmax)
+- Remove remaining .realize().tolist() sync points
+
+8.7 Deferred KV Writes with Metal Kernel Support
+**Impact:** 13x faster KV writes (47ms → 3.5ms) | **Status:** Requires Metal kernel update
+- **Goal:** Reduce KV cache write overhead by batching writes across all 22 layers
+- **Approach:** Defer K/V writes during forward pass, collect all layers' K/V, write once at end
+- **Blocker:** Metal kernel doesn't support current_k/current_v params
+  - Without it, falls back to tinygrad kernel (6.7x slower than Metal)
+  - Net result with tinygrad fallback: 141ms slower per token (save 43ms writes, lose 185ms attention)
+- **Solution:** Update Metal kernel to accept current_k/current_v buffers
+  - Add extra buffer parameters to kernel
+  - Concatenate current K/V with cached K/V in-kernel before attention
+- **Prerequisite:** Unified KVCache tensor structure (already implemented, stashed)
+
+8.8 Reduce Tinygrad Operations per Forward Pass
+**Impact:** Potentially significant | **Status:** Not started
+- Each tinygrad tensor operation builds a lazy graph node
+- More ops = more graph overhead, even if kernels are fast
+- Investigate fusing multiple ops into single custom kernels
+- Profile with DEBUG=4 to see what tinygrad auto-fuses
+- Consider rewriting hot paths as single Metal kernels (like attention)
+- Trade-off: Custom kernels lose tinygrad's lazy evaluation benefits
+
+8.9 Decode Kernel: Block-wise Parallelization
+**Impact:** Large for long contexts | **Status:** Not started
+- Current decode kernel has O(ctx_len) sequential loop per head
+- Each head processes tokens one at a time (memory bandwidth bound)
+- **Goal:** Parallelize across tokens with block-wise reductions
+- **Approach:**
+  - Split context into blocks (e.g., 64 tokens each)
+  - Each threadgroup processes one block, computes partial softmax
+  - Final reduction across blocks to combine partial results
+  - Similar to vLLM's PagedAttention V2 algorithm
+- **Complexity:** High - requires partial softmax accumulation across blocks
+- **Prerequisite:** Verify tinygrad JIT doesn't already beat this
+
+8.10 Decode Kernel: K/V Prefetching & Unrolling
+**Impact:** Medium | **Status:** Not started
+- Current kernel loads one K/V position per iteration
+- Apple GPUs benefit from coalesced memory access patterns
+- **Goal:** Process small window of positions per iteration
+- **Approach:**
+  - Unroll inner loop to process 2-4 tokens at once
+  - Use threadgroup memory to stage K/V tiles
+  - Prefetch next positions while computing current
+- **Trade-off:** More register pressure vs better memory throughput
+
+8.11 Prefill Kernel: Double-Buffering
+**Impact:** Medium | **Status:** Not started
+- Current prefill kernel: load tile → barrier → compute → barrier
+- Memory latency not hidden during compute phase
+- **Goal:** Overlap loading next tile while computing current tile
+- **Approach:**
+  - Allocate two K/V tile buffers (K0/V0, K1/V1)
+  - While computing on buffer 0, load next tile into buffer 1
+  - Swap buffers each iteration (software pipelining)
+- **Trade-off:** 2x threadgroup memory usage
+- **Note:** TILE_KV=16 already hurt performance, so memory pressure is a concern
 
 ---
 
 ## Phase 9: Feature Additions
 
-9.1 Flash Attention for Prefill
-**Impact:** 2-4x prefill speedup | **Status:** Not started
-**Prerequisite:** Online softmax ✅ (completed in 6.3)
-- Tiled attention with online softmax for prefill phase
-- Process Q, K, V in tiles (8x8 or 16x16 for M-series)
-- Use threadgroup memory for tile storage
-- O(1) memory regardless of sequence length (vs O(n²))
-- Enables longer context windows (16K+)
-
-9.2 API Server
+9.1 API Server
 **Impact:** Enables real usage | **Status:** Not started
 - FastAPI or simple HTTP server
 - POST /generate endpoint
 - Server-sent events (SSE) for streaming
 - Token-by-token streaming
 
-9.3 OpenAI API Compatibility
+9.2 OpenAI API Compatibility
 **Impact:** Drop-in replacement | **Status:** Not started
 - POST /v1/completions
 - POST /v1/chat/completions
 - Response format matching
 
-9.4 Prefill Optimization
+9.3 Prefill Optimization
 **Status:** Not started
 - Chunked prefill (don't block on long prompts) vLLM does this - singel decode prefill loop
 - Batched prefill (process multiple prefill sequences together) 
@@ -327,7 +393,7 @@
 ## Quick Reference
 
 ```
-✅ COMPLETED (Phase 1-7.4):
+✅ COMPLETED (Phase 1-8.1):
    1: Foundation
    2: Paged Attention
    3: Continuous Batching
@@ -337,14 +403,16 @@
    7.1: TinyJit for decode       → 1.5-2x ✅
    7.3: Multi-step scheduling    → <5% (future-proofs) ✅
    7.4: Reduce Python→GPU copies → 15% ✅
+   8.1: Flash Attention prefill  → 1.4-2.2x ✅
 
 🎯 NEXT (Phase 8 - Performance Tuning):
-   8.1-8.5: Buffers, async output, object pooling, INT4, sampling
+   8.2-8.6: Buffers, async output, object pooling, INT4, sampling
+   8.7: Deferred KV writes (needs Metal kernel update)
+   8.8: Reduce tinygrad ops per forward pass
 
 📦 FEATURES (Phase 9):
-   9.1: Flash Attention prefill
-   9.2: API Server
-   9.3: OpenAI compatibility
+   9.1: API Server
+   9.2: OpenAI compatibility
 
 🔮 ADVANCED (Phase 10-12):
    10: Speculative decoding, prefix caching, KV quantization

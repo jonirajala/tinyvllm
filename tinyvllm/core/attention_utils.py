@@ -10,7 +10,7 @@ Call chains from engine.py:
         self.model()                   # Llama.__call__
             → layer()                  # TransformerBlock.__call__
                 → self.attention()     # Attention.__call__
-                    → prefill_attention()
+                    → paged_prefill_attention()
                           ├── repeat_kv()           # GQA head expansion
                           ├── create_causal_mask()  # lower triangular mask
                           └── attention()           # actual matmul + softmax
@@ -19,8 +19,8 @@ Call chains from engine.py:
     self.model.batched_decode()        # all sequences at once
         → layer.batched_forward()      # TransformerBlock.batched_forward
             → self.attention.batched_forward()
-                → decode_attention()
-                      └── fused_paged_attention()  # Metal/CUDA kernel
+                → paged_decode_attention()
+                      └── paged_decode_attention()  # Metal/CUDA kernel
 """
 
 from typing import List, Optional
@@ -28,8 +28,9 @@ import math
 
 from tinygrad import Tensor
 
-from ..kernels import fused_paged_attention
-from ..kernels.paged_attention_tinygrad import fused_paged_attention_tinygrad
+from ..kernels import paged_decode_attention as paged_decode_attention_kernel
+from ..kernels import flash_prefill_attention
+from ..kernels.paged_decode_attention_tinygrad import paged_decode_attention_tinygrad
 
 
 def create_causal_mask(seq_len: int, start_pos: int = 0) -> Tensor:
@@ -65,36 +66,6 @@ def create_causal_mask(seq_len: int, start_pos: int = 0) -> Tensor:
 
     # Convert to attention mask: 0 for valid, -inf for invalid
     return Tensor.where(mask == 1, Tensor.zeros_like(mask), Tensor.full_like(mask, float('-inf')))
-
-
-def create_padding_mask(context_lens: List[int], max_len: int) -> Tensor:
-    """
-    Create mask to hide padding positions beyond each sequence's actual length.
-
-    Phase 5: Used for true batched attention with multiple sequences.
-
-    Args:
-        context_lens: Actual length of each sequence in batch
-        max_len: Maximum sequence length (padded length)
-
-    Returns:
-        mask: Tensor of shape [batch, 1, 1, max_len]
-              0 for valid positions, -inf for padding
-    """
-    batch_size = len(context_lens)
-
-    # Create position indices [0, 1, 2, ..., max_len-1]
-    positions = Tensor.arange(max_len).reshape(1, max_len)
-
-    # Create length tensor [len0, len1, ...]
-    lengths = Tensor(context_lens).reshape(batch_size, 1)
-
-    # Valid where position < length
-    valid = (positions < lengths).float()  # [batch, max_len], 1 = valid, 0 = padding
-
-    # Convert to mask: 0 for valid, -inf for padding
-    mask = Tensor.where(valid == 1, Tensor.zeros_like(valid), Tensor.full_like(valid, float('-inf')))
-    return mask.reshape(batch_size, 1, 1, max_len)
 
 
 def repeat_kv(x: Tensor, n_rep: int) -> Tensor:
@@ -165,7 +136,7 @@ def attention(
     return output.transpose(1, 2)
 
 
-def prefill_attention(
+def paged_prefill_attention(
     query: Tensor,
     kv_cache,  # KVCache instance (block-based)
     block_table: List[int],
@@ -177,7 +148,7 @@ def prefill_attention(
     Attention for prefill phase (single sequence, multiple tokens).
 
     Reads K/V from scattered blocks, handles GQA and causal masking, runs attention.
-    Called via: engine → model() → layer() → attention() → prefill_attention()
+    Called via: engine → model() → layer() → attention() → paged_prefill_attention()
 
     Args:
         query: [1, q_len, n_heads, head_dim] - single sequence, q_len tokens
@@ -219,7 +190,7 @@ def prefill_attention(
     return attention(query, k, v, mask=mask)
 
 
-def decode_attention(
+def paged_decode_attention(
     queries: List[Tensor],
     kv_cache,
     block_tables: List[List[int]],
@@ -232,7 +203,7 @@ def decode_attention(
 
     Uses fused Metal/CUDA kernel for performance. Each sequence generates one token
     but we batch them together for GPU efficiency.
-    Called via: engine → model.batched_decode() → layer.batched_forward() → decode_attention()
+    Called via: engine → model.batched_decode() → layer.batched_forward() → paged_decode_attention()
 
     Args:
         queries: List of [1, 1, n_heads, head_dim] tensors, one per sequence
@@ -256,13 +227,13 @@ def decode_attention(
     queries_stacked = Tensor.cat(*queries, dim=0)
     k_cache, v_cache = kv_cache.get_cache_tensors(layer_idx)
 
-    return fused_paged_attention(
+    return paged_decode_attention_kernel(
         queries_stacked, k_cache, v_cache, block_tables, context_lens,
         n_heads, kv_cache.n_kv_heads, head_dim, kv_cache.block_size
     )
 
 
-def decode_attention_with_tensors(
+def paged_decode_attention_with_tensors(
     queries: List[Tensor],
     kv_cache,
     block_tables_tensor: Tensor,
@@ -276,7 +247,7 @@ def decode_attention_with_tensors(
     eliminating the per-layer list→tensor conversion overhead.
 
     Called via: engine → model.batched_decode() → layer.batched_forward()
-                → attention.batched_forward() → decode_attention_with_tensors()
+                → attention.batched_forward() → paged_decode_attention_with_tensors()
 
     Args:
         queries: List of [1, 1, n_heads, head_dim] tensors, one per sequence
@@ -299,7 +270,7 @@ def decode_attention_with_tensors(
     k_cache, v_cache = kv_cache.get_cache_tensors(layer_idx)
 
     # Direct call to tensor version - no list→tensor conversion
-    return fused_paged_attention_tinygrad(
+    return paged_decode_attention_tinygrad(
         queries_stacked, k_cache, v_cache,
         block_tables_tensor, context_lens_tensor,
         n_heads, kv_cache.n_kv_heads, head_dim, kv_cache.block_size

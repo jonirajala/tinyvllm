@@ -84,7 +84,7 @@ class JitDecoder:
         head_dim = self.head_dim
         block_size = self.block_size
 
-        from ..kernels import fused_paged_attention_tinygrad
+        from ..kernels import paged_decode_attention_tinygrad
 
         @TinyJit
         def jit_forward(
@@ -111,7 +111,7 @@ class JitDecoder:
                 k_cache, v_cache = kv_cache.get_cache_tensors(layer_idx)
 
                 # JIT-compatible attention
-                attn_out = fused_paged_attention_tinygrad(
+                attn_out = paged_decode_attention_tinygrad(
                     q, k_cache, v_cache,
                     block_tables, context_lens,
                     n_heads, n_kv_heads, head_dim, block_size

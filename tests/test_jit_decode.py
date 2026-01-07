@@ -3,7 +3,7 @@
 import pytest
 from tinygrad import Tensor, dtypes
 
-from tinyvllm.kernels.paged_attention_tinygrad import fused_paged_attention_tinygrad
+from tinyvllm.kernels.paged_decode_attention_tinygrad import paged_decode_attention_tinygrad
 
 
 class TestJitPagedAttention:
@@ -29,7 +29,7 @@ class TestJitPagedAttention:
         context_lens = Tensor([20, 25], dtype=dtypes.int32).realize()
 
         # Run attention
-        output = fused_paged_attention_tinygrad(
+        output = paged_decode_attention_tinygrad(
             queries, k_cache, v_cache,
             block_tables, context_lens,
             n_heads, n_kv_heads, head_dim, block_size
@@ -59,7 +59,7 @@ class TestJitPagedAttention:
         block_tables = Tensor([[0, 1]], dtype=dtypes.int32)
         context_lens = Tensor([10], dtype=dtypes.int32)
 
-        output = fused_paged_attention_tinygrad(
+        output = paged_decode_attention_tinygrad(
             queries, k_cache, v_cache,
             block_tables, context_lens,
             n_heads, n_kv_heads, head_dim, block_size
@@ -83,7 +83,7 @@ class TestJitPagedAttention:
         block_tables = Tensor([[0, 1]], dtype=dtypes.int32)
         context_lens = Tensor([20], dtype=dtypes.int32)
 
-        output = fused_paged_attention_tinygrad(
+        output = paged_decode_attention_tinygrad(
             queries, k_cache, v_cache,
             block_tables, context_lens,
             n_heads, n_kv_heads, head_dim, block_size
@@ -110,13 +110,13 @@ class TestJitPagedAttention:
         context_lens_1 = Tensor([5, 10], dtype=dtypes.int32).realize()
         context_lens_2 = Tensor([10, 5], dtype=dtypes.int32).realize()
 
-        output_1 = fused_paged_attention_tinygrad(
+        output_1 = paged_decode_attention_tinygrad(
             queries, k_cache, v_cache,
             block_tables, context_lens_1,
             n_heads, n_kv_heads, head_dim, block_size
         ).realize()
 
-        output_2 = fused_paged_attention_tinygrad(
+        output_2 = paged_decode_attention_tinygrad(
             queries, k_cache, v_cache,
             block_tables, context_lens_2,
             n_heads, n_kv_heads, head_dim, block_size

@@ -120,6 +120,7 @@ kernel void paged_attention_online_softmax(
 
     // =========================================================================
     // Single pass: online softmax + weighted V accumulation
+    // Optimization: 1-exp branch - only compute one exp() per token instead of two
     // =========================================================================
     for (int pos = 0; pos < ctx_len; pos++) {
         int block_idx = pos / block_size;
@@ -134,20 +135,23 @@ kernel void paged_attention_online_softmax(
         float partial = lane_active ? dot(q4, k_vec[lane]) : 0.0f;
         float score = simd_sum(partial) * scale;
 
-        // Online softmax update
-        // All lanes have same score from simd_sum, so compute in lane 0 and broadcast
-        float new_max = max(running_max, score);
+        // Online softmax update with 1-exp optimization
+        // Instead of 2 exp() calls, use branching to compute only 1
+        float rescale, exp_score;
+        if (score <= running_max) {
+            // Common case: score doesn't exceed max
+            rescale = 1.0f;
+            exp_score = fast::exp(score - running_max);
+        } else {
+            // New max found: rescale old values
+            rescale = fast::exp(running_max - score);
+            exp_score = 1.0f;
+            running_max = score;
+        }
 
-        // Rescale factor for old statistics (when max increases)
-        float rescale = exp(running_max - new_max);
-
-        // New contribution
-        float exp_score = exp(score - new_max);
-
-        // Broadcast scalars to all lanes (they're already the same, but be explicit)
+        // Broadcast scalars to all lanes
         rescale = simd_broadcast_first(rescale);
         exp_score = simd_broadcast_first(exp_score);
-        new_max = simd_broadcast_first(new_max);
 
         // Update running statistics
         running_sum = running_sum * rescale + exp_score;
@@ -156,8 +160,6 @@ kernel void paged_attention_online_softmax(
             // Rescale old output and add new weighted V
             running_out = running_out * rescale + exp_score * v_vec[lane];
         }
-
-        running_max = new_max;
     }
 
     // =========================================================================
@@ -221,7 +223,7 @@ kernel void paged_attention_online_softmax_fp16(
     float running_sum = 0.0f;
     float4 running_out = float4(0.0f);
 
-    // Single pass
+    // Single pass with 1-exp optimization
     for (int pos = 0; pos < ctx_len; pos++) {
         int block_idx = pos / block_size;
         int block_offset = pos % block_size;
@@ -234,21 +236,25 @@ kernel void paged_attention_online_softmax_fp16(
         float partial = lane_active ? dot(q4, float4(k_vec[lane])) : 0.0f;
         float score = simd_sum(partial) * scale;
 
-        float new_max = max(running_max, score);
-        float rescale = exp(running_max - new_max);
-        float exp_score = exp(score - new_max);
+        // 1-exp optimization: only compute one exp() per token
+        float rescale, exp_score;
+        if (score <= running_max) {
+            rescale = 1.0f;
+            exp_score = fast::exp(score - running_max);
+        } else {
+            rescale = fast::exp(running_max - score);
+            exp_score = 1.0f;
+            running_max = score;
+        }
 
         rescale = simd_broadcast_first(rescale);
         exp_score = simd_broadcast_first(exp_score);
-        new_max = simd_broadcast_first(new_max);
 
         running_sum = running_sum * rescale + exp_score;
 
         if (lane_active) {
             running_out = running_out * rescale + exp_score * float4(v_vec[lane]);
         }
-
-        running_max = new_max;
     }
 
     // Write output as half4
@@ -420,6 +426,6 @@ class PagedAttentionOnline:
 
 
 # Export with standard name for dispatcher
-fused_paged_attention = PagedAttentionOnline.get_instance().batched
+paged_decode_attention = PagedAttentionOnline.get_instance().batched
 
 # JIT-compatible version is in paged_attention_jit.py (device-agnostic)

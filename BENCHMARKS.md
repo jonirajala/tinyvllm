@@ -4,7 +4,141 @@ Benchmark results for tinyvllm on Apple Silicon.
 
 ---
 
-# Phase 7 (Latest)
+# Phase 7.4 (Latest - 2026-01-06)
+
+## Test Configuration
+
+| Parameter | Value |
+|-----------|-------|
+| Device | Apple M4 10-core GPU |
+| Model | TinyLlama 1.1B (FP16) |
+| Model Size | 2.05 GB |
+| Dimensions | 2048 dim, 22 layers, 32 heads |
+| Date | 2026-01-06 |
+
+**Note:** Phase 8 deferred KV writes was attempted but stashed - falls back to slower tinygrad kernel, net negative.
+
+## Theoretical Limits
+
+| Metric | Value |
+|--------|-------|
+| GPU Memory Bandwidth | 120 GB/s |
+| Max tok/s (memory-bound) | 55 tok/s |
+| Min TPOT | 18.3 ms |
+
+---
+
+## Throughput
+
+| Benchmark | Tokens/sec | Utilization | vs Phase 7 |
+|-----------|------------|-------------|------------|
+| Single request | 1.7 | 3.2% | same |
+| Sequential (5 requests) | 1.7 | 3.2% | same |
+| Concurrent (5 requests) | 3.6 | 6.6% | same |
+
+**Concurrent vs Sequential speedup: 2.06x**
+
+### Context Length Scaling
+
+| Context Length | Tokens | Time (s) | Tok/sec |
+|----------------|--------|----------|---------|
+| 32 | 10 | 12.03 | 0.8 |
+| 128 | 10 | 29.61 | 0.3 |
+| 256 | 10 | 52.77 | 0.2 |
+| 512 | 10 | 99.77 | 0.1 |
+
+---
+
+## Latency
+
+| Metric | Value | vs Phase 7 |
+|--------|-------|------------|
+| TTFT (Time to First Token) | 828 ms | **-45%** |
+| TPOT (Time Per Output Token) | 574 ms | **-13%** |
+| Decode throughput | 1.7 tok/s | **+13%** |
+| E2E (15 tokens) | 8857 ms | **-12%** |
+
+### Per-Prompt Latency
+
+| Prompt | Tokens | TTFT (ms) | TPOT (ms) | tok/s |
+|--------|--------|-----------|-----------|-------|
+| Hello | 10 | 695 | 565 | 1.8 |
+| How are | 10 | 1250 | 566 | 1.8 |
+| Tell me | 10 | 1144 | 576 | 1.7 |
+
+### Context Length Scaling
+
+| Context | TTFT (ms) | TPOT (ms) | Decode tok/s |
+|---------|-----------|-----------|--------------|
+| 32 | 5426 | 601 | 1.7 |
+| 128 | 20118 | 632 | 1.6 |
+| 256 | 40348 | 642 | 1.6 |
+| 512 | 75477 | 623 | 1.6 |
+
+---
+
+## Memory
+
+| Metric | Value |
+|--------|-------|
+| Model weights | 2.05 GB |
+| KV memory per token | 22.0 KB |
+
+### KV Cache Scaling
+
+| Sequences | Tokens | KV Cache |
+|-----------|--------|----------|
+| 1 | 8 | 352.0 KB |
+| 2 | 16 | 704.0 KB |
+| 5 | 40 | 1.7 MB |
+
+---
+
+## Scalability
+
+### Throughput vs Concurrent Requests
+
+| Requests | Tok/sec | Efficiency | vs Phase 7 |
+|----------|---------|------------|------------|
+| 1 | 1.6 | 100.0% | same |
+| 2 | 2.2 | 68.7% | same |
+| 4 | 2.9 | 46.4% | **+4%** |
+
+**Best throughput: 2.9 tok/s at 4 concurrent requests**
+
+---
+
+## Timing Breakdown
+
+| Operation | Median (ms) | % of Total |
+|-----------|-------------|------------|
+| Decode forward | 434.22 | 78.3% |
+| Prefill | 2057.08 | 19.5% |
+| Sampling | 11.48 | 2.2% |
+| Tokenization | 0.05 | 0.0% |
+| Detokenization | 0.06 | 0.0% |
+
+**Decode throughput: 2.3 tok/s**
+
+---
+
+## Phase 7.4 vs Phase 7 Summary
+
+| Metric | Phase 7 | Phase 7.4 | Change |
+|--------|---------|-----------|--------|
+| Single request | 1.7 tok/s | 1.7 tok/s | same |
+| Concurrent (5) | 3.6 tok/s | 3.6 tok/s | same |
+| TTFT | 1502 ms | 828 ms | **-45%** |
+| TPOT | 657 ms | 574 ms | **-13%** |
+| Decode throughput | 1.5 tok/s | 1.7 tok/s | **+13%** |
+| Best scalability | 2.8 tok/s | 2.9 tok/s | **+4%** |
+| Decode forward | 733 ms | 434 ms | **-41%** |
+
+**Key insight:** Decode forward time dropped significantly (733→434ms, -41%), but overall throughput stayed similar due to other bottlenecks (prefill still dominates).
+
+---
+
+# Phase 7 (Previous)
 
 ## Test Configuration
 

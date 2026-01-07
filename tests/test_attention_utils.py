@@ -6,10 +6,9 @@ from tinygrad import Tensor, dtypes
 
 from tinyvllm.core.attention_utils import (
     create_causal_mask,
-    create_padding_mask,
     repeat_kv,
     attention,
-    prefill_attention,
+    paged_prefill_attention,
 )
 from tinyvllm.core.kv_cache import KVCache
 from tinyvllm.core.block_manager import BlockManager
@@ -57,25 +56,6 @@ class TestCreateCausalMask:
 
         # Second new token can attend to positions 0-4
         assert mask[1, 4].item() == 0
-
-
-class TestCreatePaddingMask:
-    def test_padding_mask_shape(self):
-        mask = create_padding_mask(context_lens=[3, 5], max_len=5)
-        assert mask.shape == (2, 1, 1, 5)
-
-    def test_padding_mask_values(self):
-        mask = create_padding_mask(context_lens=[3, 5], max_len=5)
-
-        # Sequence 0: length 3, so positions 3,4 are masked
-        assert mask[0, 0, 0, 0].item() == 0  # valid
-        assert mask[0, 0, 0, 2].item() == 0  # valid
-        assert mask[0, 0, 0, 3].item() == float('-inf')  # padding
-        assert mask[0, 0, 0, 4].item() == float('-inf')  # padding
-
-        # Sequence 1: length 5, all valid
-        for j in range(5):
-            assert mask[1, 0, 0, j].item() == 0
 
 
 class TestRepeatKV:
@@ -148,7 +128,7 @@ class TestAttention:
 
 
 class TestPrefillAttention:
-    """Tests for prefill_attention with block-based KV cache."""
+    """Tests for paged_prefill_attention with block-based KV cache."""
 
     def test_basic_usage(self):
         """Test reading K/V from block-based cache."""
@@ -185,7 +165,7 @@ class TestPrefillAttention:
         query = Tensor.randn(1, 1, n_kv_heads, head_dim)  # [batch, q_len, heads, dim]
 
         # Run attention
-        out = prefill_attention(
+        out = paged_prefill_attention(
             query=query,
             kv_cache=cache,
             block_table=block_table,
@@ -230,7 +210,7 @@ class TestPrefillAttention:
         # Prefill query (all positions)
         query = Tensor.randn(1, prompt_len, n_kv_heads, head_dim)
 
-        out = prefill_attention(
+        out = paged_prefill_attention(
             query=query,
             kv_cache=cache,
             block_table=block_table,
@@ -287,7 +267,7 @@ class TestIntegration:
         block_table = block_manager.get_block_table(seq_id)
         context_len = block_manager.get_context_length(seq_id)
         query = Tensor.randn(1, prompt_len, n_heads, head_dim)
-        out = prefill_attention(
+        out = paged_prefill_attention(
             query, cache, block_table, context_len, layer_idx=0, start_pos=0
         )
         assert out.shape == (1, prompt_len, n_heads, head_dim)
@@ -308,7 +288,7 @@ class TestIntegration:
             block_table = block_manager.get_block_table(seq_id)
             context_len = block_manager.get_context_length(seq_id)
             query = Tensor.randn(1, 1, n_heads, head_dim)
-            out = prefill_attention(
+            out = paged_prefill_attention(
                 query, cache, block_table, context_len, layer_idx=0, start_pos=current_pos
             )
             assert out.shape == (1, 1, n_heads, head_dim)

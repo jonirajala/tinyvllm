@@ -12,7 +12,7 @@ import math
 from tinygrad import Tensor, dtypes
 
 
-def fused_paged_attention_tinygrad(
+def paged_decode_attention_tinygrad(
     queries: Tensor,        # [batch, 1, n_heads, head_dim]
     k_cache: Tensor,        # [num_blocks, block_size, n_kv_heads, head_dim]
     v_cache: Tensor,        # [num_blocks, block_size, n_kv_heads, head_dim]
@@ -117,7 +117,7 @@ def fused_paged_attention_tinygrad(
     return output.transpose(1, 2)
 
 
-def fused_paged_attention_from_lists(
+def paged_decode_attention_from_lists(
     queries: Tensor,
     k_cache: Tensor,
     v_cache: Tensor,
@@ -130,7 +130,7 @@ def fused_paged_attention_from_lists(
 ) -> Tensor:
     """Convenience wrapper that accepts Python lists.
 
-    Converts lists to tensors and calls fused_paged_attention_tinygrad.
+    Converts lists to tensors and calls paged_decode_attention_tinygrad.
     Use this for simple cases; use the tensor version directly for JIT.
     """
     batch_size = len(context_lens)
@@ -144,7 +144,7 @@ def fused_paged_attention_from_lists(
     bt_tensor = Tensor(padded, dtype=dtypes.int32).reshape(batch_size, max_blocks)
     ctx_tensor = Tensor(context_lens, dtype=dtypes.int32)
 
-    return fused_paged_attention_tinygrad(
+    return paged_decode_attention_tinygrad(
         queries, k_cache, v_cache,
         bt_tensor, ctx_tensor,
         n_heads, n_kv_heads, head_dim, block_size

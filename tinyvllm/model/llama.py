@@ -11,7 +11,7 @@ from tinygrad.nn import Embedding, Linear
 from .weights import LlamaConfig
 from ..core.kv_cache import KVCache
 from ..core.block_manager import BlockManager
-from ..core.attention_utils import prefill_attention, decode_attention, decode_attention_with_tensors
+from ..core.attention_utils import paged_prefill_attention, paged_decode_attention, paged_decode_attention_with_tensors, flash_prefill_attention
 
 
 
@@ -113,15 +113,18 @@ class Attention:
             kv_cache, block_manager, layer_idx, seq_id, k[0], v[0], start_pos
         )
 
-        # Get block table for attention
-        block_table = block_manager.get_block_table(seq_id)
-        # Context length is start_pos + current tokens being processed
-        context_len = start_pos + seq_len
-
-        # Compute attention reading from scattered blocks
-        out = prefill_attention(
-            q, kv_cache, block_table, context_len, layer_idx, start_pos
-        )
+        # Phase 8.1: Use Flash Attention for prefill (seq_len > 1)
+        # Flash Attention computes directly on fresh K/V tensors with O(1) memory
+        if seq_len > 1:
+            # Use Flash Attention directly on computed K/V (not from cache)
+            out = flash_prefill_attention(q, k, v, causal=True)
+        else:
+            # Decode path (seq_len == 1): read from cache
+            block_table = block_manager.get_block_table(seq_id)
+            context_len = start_pos + seq_len
+            out = paged_prefill_attention(
+                q, kv_cache, block_table, context_len, layer_idx, start_pos
+            )
 
         # Project output
         out = out.reshape(batch, seq_len, -1)
@@ -229,7 +232,7 @@ class Attention:
 
         # Phase 7.4: Use pre-built tensors if available (eliminates per-layer conversion)
         if block_tables_tensor is not None and context_lens_tensor is not None:
-            out = decode_attention_with_tensors(
+            out = paged_decode_attention_with_tensors(
                 queries, kv_cache, block_tables_tensor, context_lens_tensor,
                 layer_idx
             )
@@ -237,7 +240,7 @@ class Attention:
             # Fallback: Build lists per-layer (original path)
             block_tables = [block_manager.get_block_table(seq_id) for seq_id in seq_ids]
             context_lens = [sp + 1 for sp in start_positions]
-            out = decode_attention(
+            out = paged_decode_attention(
                 queries, kv_cache, block_tables, context_lens,
                 layer_idx, start_positions
             )
