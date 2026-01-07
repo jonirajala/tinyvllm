@@ -154,15 +154,16 @@ def bench_full_forward_batch(model, tokenizer, config, batch_size: int = 1, num_
     from tinyvllm.engine.engine import LLMEngine
     from tinyvllm.engine.sampling import SamplingParams
 
-    # Force kernel selection
+    # Force kernel selection by overriding the dispatcher's cached kernel
     if use_metal:
-        from tinyvllm.kernels.paged_decode_attention_metal import paged_decode_attention as metal_paged
+        # Use Metal kernels
+        from tinyvllm.kernels.paged_decode_attention_metal import PagedAttentionOnline
         from tinyvllm.kernels.flash_prefill_attention_metal import flash_prefill_attention_metal
-        kernels._paged_metal_kernel = metal_paged
+        kernels._paged_decode_kernel = PagedAttentionOnline.get_instance().batched_tensors
         kernels._flash_metal_kernel = flash_prefill_attention_metal
     else:
-        # Force tinygrad kernels by setting metal kernels to tinygrad versions
-        kernels._paged_metal_kernel = kernels.paged_decode_attention_from_lists
+        # Use tinygrad kernels
+        kernels._paged_decode_kernel = kernels.paged_decode_attention_tinygrad
         kernels._flash_metal_kernel = kernels.flash_prefill_attention_tinygrad
 
     engine = LLMEngine(model, tokenizer)

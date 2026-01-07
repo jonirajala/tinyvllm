@@ -191,8 +191,8 @@ class TestAttention:
 
         # Allocate sequence in BlockManager
         block_manager.allocate_sequence(seq_id=0, num_tokens=seq)
-        out = attn(x, cos, sin, kv_cache=kv_cache, block_manager=block_manager,
-                   layer_idx=0, seq_id=0, start_pos=0)
+        out = attn(x, cos, sin, kv_cache, block_manager, layer_idx=0,
+                   seq_ids=[0], start_positions=[0])
 
         assert out.shape == (batch, seq, config.dim)
 
@@ -207,8 +207,8 @@ class TestAttention:
         cos, sin = precompute_freqs_cis(config.head_dim, seq)
 
         block_manager.allocate_sequence(seq_id=0, num_tokens=seq)
-        out = attn(x, cos, sin, kv_cache=kv_cache, block_manager=block_manager,
-                   layer_idx=0, seq_id=0, start_pos=0)
+        out = attn(x, cos, sin, kv_cache, block_manager, layer_idx=0,
+                   seq_ids=[0], start_positions=[0])
 
         assert out.shape == (batch, seq, config.dim)
 
@@ -251,8 +251,8 @@ class TestTransformerBlock:
         cos, sin = precompute_freqs_cis(config.head_dim, seq)
 
         block_manager.allocate_sequence(seq_id=0, num_tokens=seq)
-        out = block(x, cos, sin, kv_cache=kv_cache, block_manager=block_manager,
-                    layer_idx=0, seq_id=0, start_pos=0)
+        out = block(x, cos, sin, kv_cache, block_manager, layer_idx=0,
+                    seq_ids=[0], start_positions=[0])
         assert out.shape == x.shape
 
     def test_residual_connection(self):
@@ -266,8 +266,8 @@ class TestTransformerBlock:
         cos, sin = precompute_freqs_cis(config.head_dim, seq)
 
         block_manager.allocate_sequence(seq_id=0, num_tokens=seq)
-        out = block(x, cos, sin, kv_cache=kv_cache, block_manager=block_manager,
-                    layer_idx=0, seq_id=0, start_pos=0)
+        out = block(x, cos, sin, kv_cache, block_manager, layer_idx=0,
+                    seq_ids=[0], start_positions=[0])
 
         # Output should be different from input but correlated
         x_list = x.realize().tolist()
@@ -288,7 +288,7 @@ class TestLlama:
         tokens = Tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
 
         block_manager.allocate_sequence(seq_id=0, num_tokens=seq)
-        logits = model(tokens, kv_cache=kv_cache, block_manager=block_manager, seq_id=0)
+        logits = model.prefill(tokens, kv_cache=kv_cache, block_manager=block_manager, seq_id=0)
         assert logits.shape == (batch, seq, config.vocab_size)
 
     def test_incremental_generation(self):
@@ -304,7 +304,7 @@ class TestLlama:
 
         # First pass: process prompt
         prompt = Tensor([[1, 2, 3, 4]])
-        logits1 = model(prompt, start_pos=0, kv_cache=kv_cache, block_manager=block_manager, seq_id=0)
+        logits1 = model.prefill(prompt, start_pos=0, kv_cache=kv_cache, block_manager=block_manager, seq_id=0)
         assert logits1.shape == (1, 4, config.vocab_size)
 
         # Verify context length grew
@@ -312,7 +312,7 @@ class TestLlama:
 
         # Second pass: generate next token
         next_token = Tensor([[5]])
-        logits2 = model(next_token, start_pos=4, kv_cache=kv_cache, block_manager=block_manager, seq_id=0)
+        logits2 = model.prefill(next_token, start_pos=4, kv_cache=kv_cache, block_manager=block_manager, seq_id=0)
         assert logits2.shape == (1, 1, config.vocab_size)
 
         # Context length should have grown
@@ -326,7 +326,7 @@ class TestLlama:
 
         tokens = Tensor([[42]])
         block_manager.allocate_sequence(seq_id=0, num_tokens=1)
-        logits = model(tokens, kv_cache=kv_cache, block_manager=block_manager, seq_id=0)
+        logits = model.prefill(tokens, kv_cache=kv_cache, block_manager=block_manager, seq_id=0)
 
         assert logits.shape == (1, 1, config.vocab_size)
 
@@ -340,7 +340,7 @@ class TestLlama:
 
         # This is implicitly tested by the model working correctly
         tokens = Tensor([[1, 2, 3, 4, 5]])
-        logits = model(tokens, kv_cache=kv_cache, block_manager=block_manager, seq_id=0)
+        logits = model.prefill(tokens, kv_cache=kv_cache, block_manager=block_manager, seq_id=0)
 
         # Should produce valid output
         assert logits.shape == (1, 5, config.vocab_size)

@@ -9,29 +9,40 @@ Flash Attention: For prefill phase (O(1) memory, direct on fresh K/V)
 
 from tinygrad import Device
 
-# Pure tinygrad versions (device-agnostic)
+# Pure tinygrad version (device-agnostic)
 from .paged_decode_attention_tinygrad import paged_decode_attention_tinygrad
-from .paged_decode_attention_tinygrad import paged_decode_attention_from_lists
 
 # Flash attention for prefill (Phase 8.1)
 from .flash_prefill_attention_tinygrad import flash_prefill_attention_tinygrad
 
 # Lazy kernel selection - checked at call time, not import time
-_paged_metal_kernel = None
+_paged_decode_kernel = None
 _flash_metal_kernel = None
 
-def paged_decode_attention(*args, **kwargs):
-    """Select paged decode kernel based on current device."""
-    global _paged_metal_kernel
+
+def paged_decode_attention(queries, k_cache, v_cache, block_tables_tensor,
+                           context_lens_tensor, n_heads, n_kv_heads,
+                           head_dim, block_size, max_context_len=None):
+    """Select paged decode kernel based on device (tensor-based API).
+
+    On Metal: uses custom Metal kernel with online softmax.
+    On other devices: uses pure tinygrad implementation.
+    """
+    global _paged_decode_kernel
     device = Device.DEFAULT.split(":")[0].lower()
 
     if device == "metal":
-        if _paged_metal_kernel is None:
-            from .paged_decode_attention_metal import paged_decode_attention as metal_impl
-            _paged_metal_kernel = metal_impl
-        return _paged_metal_kernel(*args, **kwargs)
+        if _paged_decode_kernel is None:
+            from .paged_decode_attention_metal import PagedAttentionOnline
+            _paged_decode_kernel = PagedAttentionOnline.get_instance().batched_tensors
+
+        return _paged_decode_kernel(queries, k_cache, v_cache, block_tables_tensor,
+                                    context_lens_tensor, n_heads, n_kv_heads,
+                                    head_dim, block_size)
     else:
-        return paged_decode_attention_from_lists(*args, **kwargs)
+        return paged_decode_attention_tinygrad(queries, k_cache, v_cache, block_tables_tensor,
+                                               context_lens_tensor, n_heads, n_kv_heads,
+                                               head_dim, block_size, max_context_len)
 
 
 def flash_prefill_attention(query, key, value, causal=True):

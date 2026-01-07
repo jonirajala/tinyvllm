@@ -171,8 +171,8 @@ class TestModelWeightLoading:
 
         tokens = Tensor([[1, 2, 3, 4]])
         block_manager.allocate_sequence(seq_id=0, num_tokens=4)
-        logits = model(tokens, start_pos=0, kv_cache=kv_cache,
-                       block_manager=block_manager, seq_id=0)
+        logits = model.prefill(tokens, start_pos=0, kv_cache=kv_cache,
+                               block_manager=block_manager, seq_id=0)
 
         assert logits.shape == (1, 4, config.vocab_size)
         # Check BlockManager has tracked context length
@@ -228,7 +228,7 @@ class TestModelWeightLoading:
 
         tokens = Tensor([[1, 2, 3]])
         block_manager.allocate_sequence(seq_id=0, num_tokens=3)
-        logits = model(tokens, kv_cache=kv_cache, block_manager=block_manager, seq_id=0)
+        logits = model.prefill(tokens, kv_cache=kv_cache, block_manager=block_manager, seq_id=0)
 
         assert logits.shape == (1, 3, config.vocab_size)
 

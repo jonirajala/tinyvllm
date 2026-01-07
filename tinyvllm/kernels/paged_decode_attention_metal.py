@@ -374,7 +374,6 @@ class PagedAttentionOnline:
         assert head_dim % 4 == 0, f"head_dim must be divisible by 4, got {head_dim}"
         assert head_dim <= 128, f"head_dim must be <= 128, got {head_dim}"
         assert n_heads % n_kv_heads == 0, f"GQA requires n_heads divisible by n_kv_heads"
-
         self._ensure_compiled()
 
         batch_size = len(block_tables)
@@ -420,6 +419,70 @@ class PagedAttentionOnline:
             local_size=(32, 1, 1),
             vals=(batch_size, max_blocks, block_size, n_heads, n_kv_heads, head_dim),
             wait=False  # Async dispatch - sync happens when output is used
+        )
+
+        return output.reshape(batch_size, 1, n_heads, head_dim)
+
+    def batched_tensors(
+        self,
+        queries: Tensor,
+        k_cache: Tensor,
+        v_cache: Tensor,
+        block_tables_tensor: Tensor,  # [batch, max_blocks] int32 - already a tensor
+        context_lens_tensor: Tensor,  # [batch] int32 - already a tensor
+        n_heads: int,
+        n_kv_heads: int,
+        head_dim: int,
+        block_size: int,
+    ) -> Tensor:
+        """
+        Paged attention accepting tensors directly (no list→tensor conversion).
+
+        Phase 7.4 compatible: accepts pre-built tensors from engine.
+        """
+        # Safety assertions
+        assert head_dim % 4 == 0, f"head_dim must be divisible by 4, got {head_dim}"
+        assert head_dim <= 128, f"head_dim must be <= 128, got {head_dim}"
+        assert n_heads % n_kv_heads == 0, f"GQA requires n_heads divisible by n_kv_heads"
+
+        self._ensure_compiled()
+
+        batch_size = queries.shape[0]
+        max_blocks = block_tables_tensor.shape[1]
+
+        use_fp16 = queries.dtype == dtypes.float16
+
+        # Reuse pre-allocated output buffer
+        output = self._get_output_buffer(batch_size, n_heads, head_dim, queries.dtype)
+
+        # Tensors already exist - just ensure they're realized and get buffers
+        pt_tensor = block_tables_tensor.contiguous().realize()
+        ctx_tensor = context_lens_tensor.contiguous().realize()
+
+        pt_buf = get_metal_buffer(pt_tensor)
+        ctx_buf = get_metal_buffer(ctx_tensor)
+
+        # Get buffers
+        q_buf = get_metal_buffer(queries.reshape(batch_size, n_heads, head_dim))
+        k_buf = self._get_cached_kv_buffer(k_cache)
+        v_buf = self._get_cached_kv_buffer(v_cache)
+        out_buf = get_metal_buffer(output)
+
+        # Select kernel
+        program = self._program_fp16 if use_fp16 else self._program_fp32
+
+        # Dispatch
+        program(
+            q_buf._buf,
+            k_buf._buf,
+            v_buf._buf,
+            pt_buf._buf,
+            ctx_buf._buf,
+            out_buf._buf,
+            global_size=(n_heads, batch_size, 1),
+            local_size=(32, 1, 1),
+            vals=(batch_size, max_blocks, block_size, n_heads, n_kv_heads, head_dim),
+            wait=False
         )
 
         return output.reshape(batch_size, 1, n_heads, head_dim)

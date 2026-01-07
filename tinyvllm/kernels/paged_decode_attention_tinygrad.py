@@ -113,36 +113,3 @@ def paged_decode_attention_tinygrad(
 
     # Transpose back: [batch, 1, n_heads, head_dim]
     return output.transpose(1, 2)
-
-
-def paged_decode_attention_from_lists(
-    queries: Tensor,
-    k_cache: Tensor,
-    v_cache: Tensor,
-    block_tables: list,  # List[List[int]] or List[int] for single sequence
-    context_lens: list,  # List[int]
-    n_heads: int,
-    n_kv_heads: int,
-    head_dim: int,
-    block_size: int,
-) -> Tensor:
-    """Convenience wrapper that accepts Python lists.
-
-    Converts lists to tensors and calls paged_decode_attention_tinygrad.
-    """
-    batch_size = len(context_lens)
-    max_blocks = max(len(bt) for bt in block_tables)
-
-    # Pad and flatten block tables
-    padded = []
-    for bt in block_tables:
-        padded.extend(bt + [0] * (max_blocks - len(bt)))
-
-    bt_tensor = Tensor(padded, dtype=dtypes.int32).reshape(batch_size, max_blocks)
-    ctx_tensor = Tensor(context_lens, dtype=dtypes.int32)
-
-    return paged_decode_attention_tinygrad(
-        queries, k_cache, v_cache,
-        bt_tensor, ctx_tensor,
-        n_heads, n_kv_heads, head_dim, block_size
-    )

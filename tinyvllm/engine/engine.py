@@ -227,12 +227,11 @@ class LLMEngine:
         for seq in prefill_seqs:
             request = self.requests[seq.request_id]
             input_ids = Tensor([seq.prompt_tokens])
-            logits = self.model(
+            logits = self.model.prefill(
                 input_ids,
-                start_pos=0,
                 kv_cache=self.kv_cache,
                 block_manager=self.block_manager,
-                seq_id=seq.seq_id
+                seq_id=seq.seq_id,
             )
             # Sample next token
             next_token = sample_tokens(
@@ -268,7 +267,7 @@ class LLMEngine:
 
             # Batched forward pass
             input_ids = Tensor(tokens_list).reshape(len(decode_seqs), 1)
-            logits = self.model.batched_decode(
+            logits = self.model.decode(
                 input_ids,
                 kv_cache=self.kv_cache,
                 block_manager=self.block_manager,
