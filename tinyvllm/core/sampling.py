@@ -1,13 +1,8 @@
-"""Token sampling strategies for text generation.
+"""Token sampling strategies for text generation."""
 
-Phase 6.1: GPU-optimized sampling with batched operations.
-- GPU-based top-k, top-p filtering (no CPU sync)
-- Batched sampling across sequences
-- Single sync point per batch
-"""
-
+import math
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import List, Optional
 
 from tinygrad import Tensor
 
@@ -22,69 +17,31 @@ class SamplingParams:
 
 
 def _top_k_filter(logits: Tensor, k: int) -> Tensor:
-    """Keep only top-k logits, set rest to -inf.
-
-    Uses CPU-based partial sort which is much faster than tinygrad's GPU topk.
-    tinygrad's topk does a full bitonic sort O(n log² n) which is ~170ms for 32k vocab.
-    This CPU approach is O(n) for finding threshold + O(n) for filtering = ~1ms.
-
-    Args:
-        logits: [vocab_size] tensor of logits
-        k: number of top values to keep
-
-    Returns:
-        Filtered logits tensor
-    """
-    vocab_size = logits.shape[-1]
-    if k >= vocab_size or k <= 0:
+    """Keep only top-k logits, set rest to -inf. Uses CPU (faster than tinygrad GPU topk)."""
+    if k >= logits.shape[-1] or k <= 0:
         return logits
 
-    # Sync to CPU once - faster than GPU bitonic sort for this size
     logits_list = logits.realize().tolist()
-
-    # Partial sort to find k-th largest value (O(n) with partition)
-    # Using sorted()[:k] is still faster than GPU topk for 32k elements
-    sorted_vals = sorted(logits_list, reverse=True)
-    threshold = sorted_vals[k - 1]
-
-    # Build filtered logits
+    threshold = sorted(logits_list, reverse=True)[k - 1]
     filtered = [v if v >= threshold else float("-inf") for v in logits_list]
     return Tensor(filtered)
 
 
 def _top_p_filter(logits: Tensor, p: float) -> Tensor:
-    """Apply nucleus (top-p) filtering.
-
-    Note: Uses CPU for the filtering logic because tinygrad's vector indexing
-    and scatter ops are ~100x slower than PyTorch on large tensors (32k vocab).
-    See: https://github.com/tinygrad/tinygrad/issues/5241
-    Single sync + Python sort is faster than GPU scatter for now.
-
-    Args:
-        logits: [vocab_size] tensor of logits
-        p: cumulative probability threshold
-
-    Returns:
-        Filtered logits tensor
-    """
+    """Apply nucleus (top-p) filtering. Uses CPU (faster than tinygrad GPU scatter)."""
     if p >= 1.0:
         return logits
 
-    # Sync to CPU once
     logits_list = logits.realize().tolist()
-    vocab_size = len(logits_list)
 
-    # Compute softmax on CPU
-    import math
+    # Softmax
     max_logit = max(logits_list)
     exp_logits = [math.exp(x - max_logit) for x in logits_list]
     sum_exp = sum(exp_logits)
     probs = [e / sum_exp for e in exp_logits]
 
-    # Sort by probability descending with indices
+    # Keep tokens until cumulative prob >= p
     indexed_probs = sorted(enumerate(probs), key=lambda x: x[1], reverse=True)
-
-    # Find cumsum cutoff
     cumsum = 0.0
     keep_indices = set()
     for idx, prob in indexed_probs:
@@ -93,73 +50,40 @@ def _top_p_filter(logits: Tensor, p: float) -> Tensor:
         if cumsum >= p:
             break
 
-    # If nothing kept, keep at least the top one
     if not keep_indices:
         keep_indices.add(indexed_probs[0][0])
 
-    # Build filtered logits
-    filtered = [logits_list[i] if i in keep_indices else float("-inf") for i in range(vocab_size)]
+    filtered = [logits_list[i] if i in keep_indices else float("-inf") for i in range(len(logits_list))]
     return Tensor(filtered)
 
 
 def _multinomial_sample(logits: Tensor) -> int:
-    """Sample using Gumbel-max trick.
-
-    Args:
-        logits: [vocab_size] tensor
-
-    Returns:
-        Sampled token index
-    """
-    u = Tensor.rand(logits.shape)
-    u = u.clip(1e-10, 1.0 - 1e-10)
+    """Sample using Gumbel-max trick."""
+    u = Tensor.rand(logits.shape).clip(1e-10, 1.0 - 1e-10)
     gumbel_noise = -(-u.log()).log()
     return int((logits + gumbel_noise).argmax(axis=-1).item())
 
 
 def _repetition_penalty(logits: Tensor, penalty: float, seen_tokens: List[int]) -> Tensor:
-    """Apply repetition penalty on GPU.
-
-    Args:
-        logits: [vocab_size] tensor
-        penalty: penalty factor (>1 reduces probability of seen tokens)
-        seen_tokens: list of token ids to penalize
-
-    Returns:
-        Modified logits tensor
-    """
+    """Apply repetition penalty. Divides positive logits, multiplies negative by penalty."""
     if not seen_tokens or penalty == 1.0:
         return logits
 
-    # Create penalty multiplier tensor
-    vocab_size = logits.shape[-1]
-    penalty_mult = Tensor.ones(vocab_size)
-
-    # For seen tokens: divide positive logits by penalty, multiply negative by penalty
-    seen_set = set(seen_tokens)
-    seen_indices = Tensor(list(seen_set))
-
-    # Get logit values at seen positions
+    penalty_mult = Tensor.ones(logits.shape[-1])
+    seen_indices = Tensor(list(set(seen_tokens)))
     seen_logits = logits.gather(-1, seen_indices)
 
-    # Compute penalties: 1/penalty for positive, penalty for negative
     penalties = (seen_logits > 0).where(
         Tensor.full(seen_logits.shape, 1.0 / penalty),
         Tensor.full(seen_logits.shape, penalty)
     )
-
-    # Scatter penalties back to full tensor
     penalty_mult = penalty_mult.scatter(-1, seen_indices, penalties)
 
     return logits * penalty_mult
 
 
 def _sample_single(logits: Tensor, params: SamplingParams) -> int:
-    """Sample a single token.
-
-    TODO: Replace with true batched sampling - vectorize temperature/top_k/top_p
-    across batch dimension to avoid per-sequence loop in sample_tokens().
-    """
+    """Sample a single token. TODO: vectorize for true batched sampling."""
     if params.temperature == 0.0:
         return int(logits.argmax().item())
 
@@ -177,20 +101,7 @@ def sample_tokens(
     params: List[SamplingParams],
     seen_tokens: Optional[List[List[int]]] = None,
 ) -> List[int]:
-    """Sample tokens from logits (batched).
-
-    TODO: True batched sampling - vectorize the loop below. Currently loops
-    per-sequence because params can differ. Could group by similar params
-    or use masked operations for temperature/top_k/top_p.
-
-    Args:
-        logits: [batch, vocab_size] logits
-        params: list of SamplingParams, one per sequence
-        seen_tokens: optional list of token id lists for repetition penalty
-
-    Returns:
-        List of sampled token ids (length = batch_size)
-    """
+    """Sample tokens from logits. TODO: vectorize loop for true batched sampling."""
     batch_size = logits.shape[0]
     assert len(params) == batch_size
 
@@ -201,4 +112,3 @@ def sample_tokens(
             seq_logits = _repetition_penalty(seq_logits, seq_params.repetition_penalty, seen_tokens[i])
         results.append(_sample_single(seq_logits, seq_params))
     return results
-
