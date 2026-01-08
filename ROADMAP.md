@@ -18,12 +18,16 @@ vLLM V1's biggest optimization: cache input tensors and only apply diffs each st
 
 **Implemented:** `_bt_buffer_data` and `_ctx_buffer_data` in `engine.py`
 
-### 1.2 Object Pooling
+### 1.2 Object Pooling ✅ DONE
 **Impact:** 10-15% | **Effort:** Low | **Source:** vLLM saw 24% improvement
 
 Pool and reuse Python objects:
 - Request, Sequence, SchedulerOutput with `.reset()` methods
 - Reduces GC pressure and allocation overhead
+
+**Implemented:** `ObjectPool` in `pool.py`, pools in `scheduler.py` and `engine.py`
+
+**Note:** GenerationOutput intentionally not pooled - it's a return value that leaves the engine boundary. Callers may store references (e.g., `list(engine.run())`), so recycling would corrupt their data.
 
 ### 1.3 Batched Sampling
 **Impact:** 5-10% | **Effort:** Low
@@ -260,7 +264,7 @@ When OOM:
 ```
 QUICK WINS (do first):
 ├── 1.1 Buffer reuse                     ~15% ✅ DONE
-├── 1.2 Object pooling                   ~10%
+├── 1.2 Object pooling                   ~10% ✅ DONE
 ├── 1.3 Batched sampling                 ~5%
 └── 1.4 Incremental block allocation     ~40% memory
 

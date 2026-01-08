@@ -1,9 +1,10 @@
 """Scheduler for continuous batching with BlockManager integration."""
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from .sequence import Request, Sequence, SequenceStatus, SchedulerOutput
 from .block_manager import BlockManager
+from .pool import ObjectPool
 
 
 class Scheduler:
@@ -16,6 +17,9 @@ class Scheduler:
         self.waiting: List[Request] = []
         self.running: Dict[int, Sequence] = {}
         self.next_seq_id = 0
+        self._batch_pool: ObjectPool[SchedulerOutput] = ObjectPool(SchedulerOutput)
+        self._seq_pool: ObjectPool[Sequence] = ObjectPool(lambda: Sequence(0, 0, []))
+        self._last_batch: Optional[SchedulerOutput] = None
 
     def add_request(self, request: Request) -> None:
         """Add a new request to the waiting queue."""
@@ -27,7 +31,11 @@ class Scheduler:
 
     def schedule(self) -> SchedulerOutput:
         """Select sequences for the next batch."""
-        batch = SchedulerOutput()
+        if self._last_batch:
+            self._batch_pool.release(self._last_batch.reset())
+
+        batch = self._batch_pool.acquire()
+        batch.reset()
         batch.scheduled_seqs = list(self.running.values())
 
         while len(batch.scheduled_seqs) < self.max_batch_size and self.waiting:
@@ -39,20 +47,25 @@ class Scheduler:
             self.block_manager.allocate_sequence(self.next_seq_id, num_tokens)
 
             self.waiting.pop(0)
-            sequence = request.create_sequence(self.next_seq_id)
+            sequence = self._seq_pool.acquire()
+            sequence.reset(self.next_seq_id, request.request_id, request.prompt_tokens)
+            request.sequence = sequence
             self.next_seq_id += 1
             self.running[sequence.seq_id] = sequence
             batch.scheduled_seqs.append(sequence)
 
+        self._last_batch = batch
         return batch
 
     def update(self, finished_seqs: List[int]) -> None:
         """Remove finished sequences and free their blocks."""
         for seq_id in finished_seqs:
             if seq_id in self.running:
-                self.running[seq_id].status = SequenceStatus.FINISHED
+                seq = self.running[seq_id]
+                seq.status = SequenceStatus.FINISHED
                 del self.running[seq_id]
                 self.block_manager.free_sequence(seq_id)
+                self._seq_pool.release(seq)
 
     def get_num_waiting(self) -> int:
         """Get number of waiting requests."""
@@ -73,6 +86,7 @@ class Scheduler:
             if seq.request_id == request_id:
                 del self.running[seq_id]
                 self.block_manager.free_sequence(seq_id)
+                self._seq_pool.release(seq)
                 return True
 
         return False

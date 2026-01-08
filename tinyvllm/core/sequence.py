@@ -46,6 +46,15 @@ class Sequence:
         """Check if sequence has finished."""
         return self.status == SequenceStatus.FINISHED
 
+    def reset(self, seq_id: int, request_id: int, prompt_tokens: List[int]) -> 'Sequence':
+        """Reset for reuse from pool."""
+        self.seq_id = seq_id
+        self.request_id = request_id
+        self.prompt_tokens = prompt_tokens
+        self.output_tokens.clear()
+        self.status = SequenceStatus.RUNNING
+        return self
+
 
 @dataclass
 class Request:
@@ -67,6 +76,17 @@ class Request:
         )
         return self.sequence
 
+    def reset(self, request_id: int, prompt: str, prompt_tokens: List[int],
+              sampling_params: 'SamplingParams') -> 'Request':
+        """Reset for reuse from pool."""
+        self.request_id = request_id
+        self.prompt = prompt
+        self.prompt_tokens = prompt_tokens
+        self.sampling_params = sampling_params
+        self.arrival_time = time.time()
+        self.sequence = None
+        return self
+
 
 @dataclass
 class SchedulerOutput:
@@ -74,3 +94,10 @@ class SchedulerOutput:
     scheduled_seqs: List[Sequence] = field(default_factory=list)
     num_prefill_tokens: int = 0
     num_decode_tokens: int = 0
+
+    def reset(self) -> 'SchedulerOutput':
+        """Reset for reuse from pool."""
+        self.scheduled_seqs.clear()
+        self.num_prefill_tokens = 0
+        self.num_decode_tokens = 0
+        return self

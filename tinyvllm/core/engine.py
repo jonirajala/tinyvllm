@@ -11,6 +11,7 @@ from .block_manager import BlockManager
 from .kv_cache import KVCache
 from .sampling import SamplingParams, sample_tokens
 from .output_processor import OutputProcessor
+from .pool import ObjectPool
 
 if TYPE_CHECKING:
     from ..model.llama import Llama
@@ -61,6 +62,9 @@ class LLMEngine:
         self.scheduler = Scheduler(max_batch_size, block_manager=self.block_manager)
         self.next_request_id = 0
         self.requests: Dict[int, Request] = {}
+        self._request_pool: ObjectPool[Request] = ObjectPool(
+            lambda: Request(0, "", [], SamplingParams())
+        )
         self._output_processor = OutputProcessor(
             tokenizer=self.tokenizer,
             async_mode=async_output,
@@ -90,7 +94,8 @@ class LLMEngine:
 
         if sampling_params is None: sampling_params = SamplingParams()
 
-        request = Request(
+        request = self._request_pool.acquire()
+        request.reset(
             request_id=request_id,
             prompt=prompt,
             prompt_tokens=self.tokenizer.encode(prompt),
@@ -181,6 +186,7 @@ class LLMEngine:
             decode_seqs = still_active
 
         self.scheduler.update(finished_seqs)
+        self._cleanup_finished_requests(finished_seqs)
         return self._output_processor.poll_all()
 
 
@@ -211,6 +217,15 @@ class LLMEngine:
         if sequence.output_tokens[-1] == self.tokenizer.eos_id: return 'eos'
         if sequence.get_output_len() >= request.sampling_params.max_tokens: return 'length'
         return None
+
+    def _cleanup_finished_requests(self, finished_seqs: List[int]) -> None:
+        """Release finished requests back to pool."""
+        for seq_id in finished_seqs:
+            for req_id, req in list(self.requests.items()):
+                if req.sequence and req.sequence.seq_id == seq_id:
+                    del self.requests[req_id]
+                    self._request_pool.release(req)
+                    break
 
     def _prepare_batch_tensors(
         self,
