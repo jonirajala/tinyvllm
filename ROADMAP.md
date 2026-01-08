@@ -8,13 +8,15 @@ Future improvements based on research of vLLM, SGLang, TensorRT-LLM, and llama.c
 
 ## Phase 1: Quick Wins (10-30% improvement)
 
-### 1.1 Buffer Reuse with Tensor.assign()
+### 1.1 Buffer Reuse ✅ DONE
 **Impact:** 10-20% | **Effort:** Low | **Source:** vLLM V1 "Persistent Batch"
 
 vLLM V1's biggest optimization: cache input tensors and only apply diffs each step.
 - Pre-allocate decode buffers at engine init
 - Use `Tensor.assign()` to update in-place
 - Avoid Tensor.zeros() allocation each step
+
+**Implemented:** `_bt_buffer_data` and `_ctx_buffer_data` in `engine.py`
 
 ### 1.2 Object Pooling
 **Impact:** 10-15% | **Effort:** Low | **Source:** vLLM saw 24% improvement
@@ -27,6 +29,19 @@ Pool and reuse Python objects:
 **Impact:** 5-10% | **Effort:** Low
 
 Sample all sequences in batch together instead of loop.
+
+### 1.4 Incremental Block Allocation
+**Impact:** 30-50% memory savings | **Effort:** Low | **Source:** [vLLM PagedAttention](https://blog.vllm.ai/2025/09/05/anatomy-of-vllm.html)
+
+Current approach pre-allocates all blocks upfront (wastes 60-80% memory).
+vLLM allocates blocks incrementally as tokens are generated.
+
+- Use `get_slot()` instead of pre-allocating full sequence length
+- Only grab new block when current block is full
+- Enables more concurrent sequences with same memory
+
+**Already implemented:** `block_manager.get_slot()` exists but unused.
+**TODO:** Refactor engine to use incremental allocation.
 
 ---
 
@@ -244,9 +259,10 @@ When OOM:
 
 ```
 QUICK WINS (do first):
-├── 1.1 Buffer reuse (Tensor.assign)     ~15%
+├── 1.1 Buffer reuse                     ~15% ✅ DONE
 ├── 1.2 Object pooling                   ~10%
-└── 1.3 Batched sampling                 ~5%
+├── 1.3 Batched sampling                 ~5%
+└── 1.4 Incremental block allocation     ~40% memory
 
 HIGH IMPACT (do next):
 ├── 2.1 Chunked prefill                  ~50% throughput

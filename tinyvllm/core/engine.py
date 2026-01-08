@@ -1,16 +1,7 @@
-"""
-LLM Engine - Main orchestrator
-
-The engine ties everything together:
-- Model (LLaMA)
-- KVCache (paged attention storage)
-- BlockManager (memory allocation)
-- Scheduler (batch composition)
-- Tokenizer (encode/decode)
-"""
+"""LLM Engine - orchestrates model, KV cache, scheduler, and tokenizer."""
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Dict, Iterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from tinygrad import Tensor, dtypes
 
@@ -27,38 +18,20 @@ if TYPE_CHECKING:
 
 @dataclass
 class GenerationOutput:
-    """
-    Output from a completed generation.
-
-    Attributes:
-        request_id: Which request this is for
-        text: Generated text
-        tokens: Generated token IDs
-        finish_reason: Why generation stopped ('eos', 'length', 'abort')
-    """
+    """Output from a completed generation."""
     request_id: int
     text: str
     tokens: List[int]
-    finish_reason: str
+    finish_reason: str  # 'eos', 'length', or 'abort'
 
 
 class LLMEngine:
-    """
-    Main engine for LLM inference with continuous batching.
-
-    The engine manages the full lifecycle:
-    1. Accept requests via add_request()
-    2. Schedule batches via internal Scheduler
-    3. Run model forward pass
-    4. Sample tokens
-    5. Return completed generations
-
-    """
+    """Main engine for LLM inference with continuous batching."""
 
     def __init__(
         self,
         model: "Llama",
-        tokenizer,
+        tokenizer: Any,
         max_batch_size: int = 8,
         num_blocks: int = 100,
         block_size: int = 16,
@@ -66,36 +39,17 @@ class LLMEngine:
         async_output: bool = False,
         output_callback: Optional[Callable[[GenerationOutput], None]] = None,
     ):
-        """
-        Initialize the engine.
-
-        Args:
-            model: LLaMA model instance
-            tokenizer: Tokenizer with encode/decode methods
-            max_batch_size: Maximum sequences per batch
-            num_blocks: Number of KV cache blocks (Phase 4)
-            block_size: Tokens per block (Phase 4)
-            num_scheduler_steps: Decode steps per scheduler cycle (Phase 7.3)
-                1 = best latency (default), 4-8 = better throughput
-            async_output: Enable async detokenization (Phase 8.3)
-                Detokenize on background thread while GPU computes next step
-            output_callback: Callback for async outputs (requires async_output=True)
-                If None, use poll_outputs() to retrieve results
-        """
         self.model = model
         self.tokenizer = tokenizer
         self.max_batch_size = max_batch_size
         self.block_size = block_size
         self.num_scheduler_steps = num_scheduler_steps
 
-        # Phase 4: Create BlockManager for memory allocation
         self.block_manager = BlockManager(
             num_gpus=1,
             blocks_per_gpu=num_blocks,
             block_size=block_size,
         )
-
-        # Phase 4: Create block-based KVCache (uses model dtype for FP16 support)
         self.kv_cache = KVCache(
             num_layers=model.config.n_layers,
             num_blocks=num_blocks,
@@ -104,25 +58,22 @@ class LLMEngine:
             head_dim=model.config.head_dim,
             dtype=model.config.dtype,
         )
-
-        # Phase 4: Scheduler with BlockManager integration
         self.scheduler = Scheduler(max_batch_size, block_manager=self.block_manager)
         self.next_request_id = 0
-
-        # Mappings
-        self.requests: Dict[int, Request] = {}  # request_id -> Request
-
-        # Phase 8.3: Output processor (handles both sync and async)
+        self.requests: Dict[int, Request] = {}
         self._output_processor = OutputProcessor(
             tokenizer=self.tokenizer,
             async_mode=async_output,
             callback=output_callback,
         )
 
-        # JIT decode functions - one per batch size for shape stability
-        # TinyJit requires identical shapes, so we cache separate functions
+        # JIT requires fixed shapes - cache separate function per batch size
         self._jit_decode_fns: Dict[int, object] = {}
-        self._jit_max_blocks = 64  # Max blocks for JIT padding
+        self._jit_max_blocks = 64
+
+        # Pre-allocated buffers to avoid allocation each step
+        self._bt_buffer_data = [0] * (max_batch_size * self._jit_max_blocks)
+        self._ctx_buffer_data = [0] * max_batch_size
 
     def add_request(
         self,
@@ -130,17 +81,7 @@ class LLMEngine:
         sampling_params: Optional[SamplingParams] = None,
         request_id: Optional[int] = None,
     ) -> int:
-        """
-        Add a new generation request.
-
-        Args:
-            prompt: Input prompt string
-            sampling_params: Sampling parameters (default: greedy)
-            request_id: Optional custom ID (auto-assigned if None)
-
-        Returns:
-            The request ID
-        """
+        """Add a generation request. Returns request_id."""
         if request_id is None:
             request_id = self.next_request_id
             self.next_request_id += 1
@@ -161,86 +102,54 @@ class LLMEngine:
         return request_id
 
     def step(self) -> List[GenerationOutput]:
-        """
-        Run one or more generation steps.
-
-        Phase 7.3: Multi-step scheduling - runs num_scheduler_steps decode
-        iterations before returning, amortizing scheduler overhead.
-
-        This is the core engine loop iteration:
-        1. Get batch from scheduler (once per step() call)
-        2. Process prefill sequences one-by-one
-        3. Run multi-step decode loop
-        4. Update scheduler (once at end)
-        5. Return finished outputs
-
-        Returns:
-            List of GenerationOutput for requests that finished this step
-        """
+        """Run one generation step. Returns finished outputs."""
         batch = self.scheduler.schedule()
         if not batch.scheduled_seqs: return []
 
         finished_seqs = []
+        prefill_seqs, decode_seqs = [], []
+        for s in batch.scheduled_seqs:
+            (prefill_seqs if s.get_output_len() == 0 else decode_seqs).append(s)
 
-        # Separate prefill and decode sequences
-        prefill_seqs = [s for s in batch.scheduled_seqs if s.get_output_len() == 0]
-        decode_seqs = [s for s in batch.scheduled_seqs if s.get_output_len() > 0]
-
-        # Process prefill sequences one-by-one (different lengths)
+        # Prefill: process one-by-one (variable lengths)
         for seq in prefill_seqs:
             request = self.requests[seq.request_id]
-            input_ids = Tensor([seq.prompt_tokens])
             logits = self.model.prefill(
-                input_ids,
+                tokens=Tensor([seq.prompt_tokens]),
                 kv_cache=self.kv_cache,
                 block_manager=self.block_manager,
                 seq_id=seq.seq_id,
             )
-            # Sample next token
             next_token = sample_tokens(
-                logits[:, -1, :],  # [1, vocab_size]
-                [request.sampling_params],
-                [seq.get_all_tokens()]
+                logits=logits[:, -1, :],
+                params=[request.sampling_params],
+                seen_tokens=[seq.get_all_tokens()]
             )[0]
-
             seq.append_token(next_token)
 
-            finish_reason = self._check_finished(next_token, seq, request)
-            if finish_reason:
+            if finish_reason := self._check_finished(seq, request):
                 finished_seqs.append(seq.seq_id)
                 self._output_processor.submit(
                     request_id=request.request_id,
                     tokens=seq.output_tokens,
                     finish_reason=finish_reason
                 )
-            # Sequence stays in self.running - will be scheduled for decode on next step()
 
-        # Multi-step decode loop (Phase 7.3) - only for sequences already in decode phase
-        for step_idx in range(self.num_scheduler_steps):
+        # Decode: batched multi-step loop
+        for _ in range(self.num_scheduler_steps):
             if not decode_seqs: break
 
-            # Prepare batch
             batch_size = len(decode_seqs)
-            tokens_list = [s.output_tokens[-1] for s in decode_seqs]
             seq_ids = [s.seq_id for s in decode_seqs]
             start_positions = [s.get_len() - 1 for s in decode_seqs]
-
-            # Phase 7.4: Build block_tables and context_lens tensors once
-            # (eliminates 32x per-layer Python list → Tensor conversions)
             bt_tensor, ctx_tensor = self._prepare_batch_tensors(seq_ids, start_positions)
 
-            # Get or create JIT function for this batch size
-            # TinyJit requires identical shapes, so we cache per batch size
             if batch_size not in self._jit_decode_fns:
-                self._jit_decode_fns[batch_size] = self.model.create_jit_decode(
-                    block_size=self.block_size
-                )
+                self._jit_decode_fns[batch_size] = self.model.create_jit_decode(block_size=self.block_size)
             jit_fn = self._jit_decode_fns[batch_size]
 
-            # Batched forward pass (JIT-optimized, ~4x faster)
-            input_ids = Tensor(tokens_list).reshape(batch_size, 1)
             logits = self.model.decode(
-                input_ids,
+                tokens=Tensor([s.output_tokens[-1] for s in decode_seqs]).reshape(batch_size, 1),
                 kv_cache=self.kv_cache,
                 block_manager=self.block_manager,
                 seq_ids=seq_ids,
@@ -251,17 +160,16 @@ class LLMEngine:
                 max_blocks=self._jit_max_blocks,
             )
 
-            # Sample tokens for batch
-            batch_logits = logits[:, 0, :]  # [batch_size, vocab_size]
-            params_list = [self.requests[s.request_id].sampling_params for s in decode_seqs]
-            seen_tokens_batch = [s.get_all_tokens() for s in decode_seqs]
-            next_tokens = sample_tokens(batch_logits, params_list, seen_tokens_batch)
+            next_tokens = sample_tokens(
+                logits=logits[:, 0, :],
+                params=[self.requests[s.request_id].sampling_params for s in decode_seqs],
+                seen_tokens=[s.get_all_tokens() for s in decode_seqs],
+            )
 
-            # Process results
             still_active = []
             for seq, next_token in zip(decode_seqs, next_tokens):
                 seq.append_token(next_token)
-                if finish_reason := self._check_finished(next_token, seq, self.requests[seq.request_id]):
+                if finish_reason := self._check_finished(seq, self.requests[seq.request_id]):
                     finished_seqs.append(seq.seq_id)
                     self._output_processor.submit(
                         request_id=seq.request_id,
@@ -272,96 +180,36 @@ class LLMEngine:
                     still_active.append(seq)
             decode_seqs = still_active
 
-        # Update scheduler (tokens already appended, just handle finished)
         self.scheduler.update(finished_seqs)
-
         return self._output_processor.poll_all()
 
 
     def run(self) -> Iterator[GenerationOutput]:
-        """
-        Run until all requests complete.
-
-        Yields:
-            GenerationOutput for each completed request
-        """
+        """Run until all requests complete. Yields outputs as they finish."""
         while self.scheduler.has_unfinished():
             yield from self.step()
-        # Drain any remaining async outputs
         yield from self._output_processor.drain()
 
     def has_unfinished(self) -> bool:
-        """
-        Check if there are pending requests.
-
-        Returns:
-            True if waiting or running requests exist
-        """
+        """Check if there are pending requests."""
         return self.scheduler.has_unfinished()
 
     def abort_request(self, request_id: int) -> bool:
-        """
-        Abort a request.
-
-        Args:
-            request_id: ID of request to abort
-
-        Returns:
-            True if request was found and aborted
-        """
+        """Abort a request. Returns True if found and aborted."""
         return self.scheduler.abort_request(request_id)
 
     def poll_outputs(self) -> List[GenerationOutput]:
-        """
-        Poll for completed outputs.
-
-        Useful for manual control instead of using run().
-
-        Returns:
-            List of completed GenerationOutput objects.
-
-        Example:
-            engine = LLMEngine(..., async_output=True)
-            engine.add_request("Hello")
-            while engine.has_unfinished():
-                engine.step()
-                for output in engine.poll_outputs():
-                    print(output.text)
-        """
+        """Poll for completed async outputs."""
         return self._output_processor.poll_all()
 
     def shutdown(self) -> None:
-        """
-        Clean shutdown of engine resources.
-
-        Stops the async output processor thread if running.
-        """
+        """Clean shutdown of engine resources."""
         self._output_processor.shutdown()
 
-    def _check_finished(
-        self,
-        token: int,
-        sequence: Sequence,
-        request: Request,
-    ) -> Optional[str]:
-        """
-        Check if sequence should finish.
-
-        Note: Called AFTER token is appended to sequence (Phase 7.3 change).
-
-        Args:
-            token: Just-generated token (already appended)
-            sequence: The sequence (with token already appended)
-            request: The request
-
-        Returns:
-            Finish reason ('eos', 'length') or None if not finished
-        """
-        if token == self.tokenizer.eos_id:
-            return 'eos'
-        # Token already appended, so check get_output_len() directly
-        if sequence.get_output_len() >= request.sampling_params.max_tokens:
-            return 'length'
+    def _check_finished(self, sequence: Sequence, request: Request) -> Optional[str]:
+        """Check if sequence should finish. Returns finish reason or None."""
+        if sequence.output_tokens[-1] == self.tokenizer.eos_id: return 'eos'
+        if sequence.get_output_len() >= request.sampling_params.max_tokens: return 'length'
         return None
 
     def _prepare_batch_tensors(
@@ -369,38 +217,21 @@ class LLMEngine:
         seq_ids: List[int],
         start_positions: List[int],
     ) -> Tuple[Tensor, Tensor]:
-        """Build block_tables and context_lens tensors for batched decode.
-
-        Phase 7.4: Build these once per step instead of per-layer.
-        Eliminates 32x redundant Python list → Tensor conversions.
-
-        Args:
-            seq_ids: List of sequence IDs in the batch
-            start_positions: Start position for each sequence
-
-        Returns:
-            block_tables_tensor: [batch, max_blocks] int32
-            context_lens_tensor: [batch] int32
-        """
+        """Build block_tables and context_lens tensors for batched decode."""
         batch_size = len(seq_ids)
+        max_blocks = self._jit_max_blocks
+        bt_data = self._bt_buffer_data
+        ctx_data = self._ctx_buffer_data
 
-        # Determine max blocks needed (use actual block table sizes)
-        block_tables_raw = [self.block_manager.get_block_table(sid) for sid in seq_ids]
-        max_blocks = max(len(bt) for bt in block_tables_raw) if block_tables_raw else 1
+        for i, (sid, start_pos) in enumerate(zip(seq_ids, start_positions)):
+            bt = self.block_manager.get_block_table(sid)
+            offset = i * max_blocks
+            for j in range(max_blocks):
+                bt_data[offset + j] = bt[j] if j < len(bt) else 0
+            ctx_data[i] = start_pos + 1
 
-        # Pad block tables and build context lens
-        block_tables_padded = []
-        context_lens = []
-
-        for bt, start_pos in zip(block_tables_raw, start_positions):
-            block_tables_padded.append(bt + [0] * (max_blocks - len(bt)))
-            context_lens.append(start_pos + 1)
-
-        # Flatten and create tensors
-        bt_flat = [b for row in block_tables_padded for b in row]
-        bt_tensor = Tensor(bt_flat, dtype=dtypes.int32).reshape(batch_size, max_blocks)
-        ctx_tensor = Tensor(context_lens, dtype=dtypes.int32)
-
+        bt_tensor = Tensor(bt_data[:batch_size * max_blocks], dtype=dtypes.int32).reshape(batch_size, max_blocks)
+        ctx_tensor = Tensor(ctx_data[:batch_size], dtype=dtypes.int32)
         return bt_tensor, ctx_tensor
 
 
@@ -409,19 +240,7 @@ def generate_batch(
     prompts: List[str],
     sampling_params: Optional[SamplingParams] = None,
 ) -> List[str]:
-    """
-    Generate completions for multiple prompts.
-
-    Convenience function for batch generation.
-
-    Args:
-        engine: LLMEngine instance
-        prompts: List of prompts
-        sampling_params: Shared sampling params
-
-    Returns:
-        List of generated texts (in same order as prompts)
-    """
+    """Generate completions for multiple prompts. Returns texts in input order."""
     request_ids = [engine.add_request(p, sampling_params) for p in prompts]
     results = {out.request_id: out.text for out in engine.run()}
     return [results[rid] for rid in request_ids]

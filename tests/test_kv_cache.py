@@ -140,8 +140,8 @@ class TestWriteKV:
             assert k_read.sum().item() == (layer_idx + 1) * 2 * 4
 
 
-class TestWriteKVBatch:
-    def test_write_kv_batch_basic(self):
+class TestWriteKV:
+    def test_write_kv_basic(self):
         cache = KVCache(
             num_layers=2,
             num_blocks=4,
@@ -155,14 +155,14 @@ class TestWriteKVBatch:
         k = Tensor.ones(5, 2, 4)  # [num_tokens, n_kv_heads, head_dim]
         v = Tensor.ones(5, 2, 4) * 2
 
-        cache.write_kv_batch(layer_idx=0, block_id=0, start_offset=0, k=k, v=v)
+        cache.write_kv(layer_idx=0, block_id=0, start_offset=0, k=k, v=v)
 
         # Verify all 5 positions
         for i in range(5):
             k_read = cache.k_cache[0][0, i]  # [block_id, offset]
             assert k_read.sum().item() == 8  # 1 * 2 * 4
 
-    def test_write_kv_batch_with_offset(self):
+    def test_write_kv_with_offset(self):
         cache = KVCache(
             num_layers=2,
             num_blocks=4,
@@ -176,7 +176,7 @@ class TestWriteKVBatch:
         k = Tensor.ones(3, 2, 4) * 5
         v = Tensor.ones(3, 2, 4) * 5
 
-        cache.write_kv_batch(layer_idx=0, block_id=0, start_offset=5, k=k, v=v)
+        cache.write_kv(layer_idx=0, block_id=0, start_offset=5, k=k, v=v)
 
         # Verify positions 5, 6, 7 have the values
         for i in range(5, 8):
@@ -195,11 +195,10 @@ class TestReadKVBlocks:
             dtype=dtypes.float32
         )
 
-        # Write 5 tokens
-        for i in range(5):
-            k = Tensor.ones(2, 4) * (i + 1)
-            v = Tensor.ones(2, 4) * (i + 1)
-            cache.write_kv(layer_idx=0, block_id=0, offset=i, k=k, v=v)
+        # Write 5 tokens at once
+        k = Tensor.arange(40).reshape(5, 2, 4).float()
+        v = Tensor.arange(40).reshape(5, 2, 4).float() + 100
+        cache.write_kv(layer_idx=0, block_id=0, start_offset=0, k=k, v=v)
 
         # Read back
         block_table = [0]
@@ -220,15 +219,13 @@ class TestReadKVBlocks:
 
         # Fill two blocks (8 tokens total)
         # Block 0: positions 0-3
-        for i in range(4):
-            k = Tensor.ones(2, 4) * (i + 1)
-            v = Tensor.ones(2, 4) * (i + 1)
-            cache.write_kv(layer_idx=0, block_id=0, offset=i, k=k, v=v)
+        k0 = Tensor.arange(32).reshape(4, 2, 4).float()
+        v0 = Tensor.arange(32).reshape(4, 2, 4).float() + 100
+        cache.write_kv(layer_idx=0, block_id=0, start_offset=0, k=k0, v=v0)
         # Block 1: positions 4-7
-        for i in range(4):
-            k = Tensor.ones(2, 4) * (i + 5)
-            v = Tensor.ones(2, 4) * (i + 5)
-            cache.write_kv(layer_idx=0, block_id=1, offset=i, k=k, v=v)
+        k1 = Tensor.arange(32).reshape(4, 2, 4).float() + 32
+        v1 = Tensor.arange(32).reshape(4, 2, 4).float() + 132
+        cache.write_kv(layer_idx=0, block_id=1, start_offset=0, k=k1, v=v1)
 
         # Read back 6 tokens spanning 2 blocks
         block_table = [0, 1]
@@ -287,8 +284,8 @@ class TestIntegration:
         v_prefill = Tensor.arange(40).reshape(5, 2, 4).float() + 100
 
         for layer_idx in range(2):
-            cache.write_kv_batch(layer_idx=layer_idx, block_id=0, start_offset=0,
-                                k=k_prefill, v=v_prefill)
+            cache.write_kv(layer_idx=layer_idx, block_id=0, start_offset=0,
+                           k=k_prefill, v=v_prefill)
 
         # Read back and verify
         block_table = [0]
@@ -297,11 +294,11 @@ class TestIntegration:
         assert v_read.shape == (5, 2, 4)
 
         # Simulate decode: add one more token
-        k_decode = Tensor.ones(2, 4) * 999
-        v_decode = Tensor.ones(2, 4) * 888
+        k_decode = Tensor.ones(1, 2, 4) * 999
+        v_decode = Tensor.ones(1, 2, 4) * 888
 
         for layer_idx in range(2):
-            cache.write_kv(layer_idx=layer_idx, block_id=0, offset=5, k=k_decode, v=v_decode)
+            cache.write_kv(layer_idx=layer_idx, block_id=0, start_offset=5, k=k_decode, v=v_decode)
 
         # Read all 6 tokens
         k_read, v_read = cache.read_kv_blocks(layer_idx=0, block_ids=block_table, context_len=6)
@@ -320,13 +317,18 @@ class TestIntegration:
 
         # Write 10 tokens (needs 3 blocks with block_size=4)
         block_table = [0, 1, 2]
-        for pos in range(10):
-            block_idx = pos // 4
-            offset = pos % 4
-            block_id = block_table[block_idx]
-            k = Tensor.ones(2, 4) * (pos + 1)
-            v = Tensor.ones(2, 4) * (pos + 1)
-            cache.write_kv(layer_idx=0, block_id=block_id, offset=offset, k=k, v=v)
+        # Block 0: tokens 0-3, Block 1: tokens 4-7, Block 2: tokens 8-9
+        k0 = Tensor.stack(*[Tensor.ones(2, 4) * (i + 1) for i in range(4)])
+        v0 = Tensor.stack(*[Tensor.ones(2, 4) * (i + 1) for i in range(4)])
+        cache.write_kv(layer_idx=0, block_id=0, start_offset=0, k=k0, v=v0)
+
+        k1 = Tensor.stack(*[Tensor.ones(2, 4) * (i + 5) for i in range(4)])
+        v1 = Tensor.stack(*[Tensor.ones(2, 4) * (i + 5) for i in range(4)])
+        cache.write_kv(layer_idx=0, block_id=1, start_offset=0, k=k1, v=v1)
+
+        k2 = Tensor.stack(*[Tensor.ones(2, 4) * (i + 9) for i in range(2)])
+        v2 = Tensor.stack(*[Tensor.ones(2, 4) * (i + 9) for i in range(2)])
+        cache.write_kv(layer_idx=0, block_id=2, start_offset=0, k=k2, v=v2)
 
         # Read all 10 tokens
         k_read, v_read = cache.read_kv_blocks(layer_idx=0, block_ids=block_table, context_len=10)
@@ -350,9 +352,9 @@ class TestIntegration:
 
         # Write different values to each layer
         for layer_idx in range(4):
-            k = Tensor.ones(2, 4) * (layer_idx + 1)
-            v = Tensor.ones(2, 4) * (layer_idx + 1) * 10
-            cache.write_kv(layer_idx=layer_idx, block_id=0, offset=0, k=k, v=v)
+            k = Tensor.ones(1, 2, 4) * (layer_idx + 1)
+            v = Tensor.ones(1, 2, 4) * (layer_idx + 1) * 10
+            cache.write_kv(layer_idx=layer_idx, block_id=0, start_offset=0, k=k, v=v)
 
         # Verify each layer has correct value
         for layer_idx in range(4):

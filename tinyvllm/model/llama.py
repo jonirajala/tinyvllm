@@ -265,7 +265,7 @@ class Attention:
             # Batch write all tokens that go into this block
             k_batch = k[token_idx:token_idx + tokens_in_block]
             v_batch = v[token_idx:token_idx + tokens_in_block]
-            kv_cache.write_kv_batch(layer_idx, block_id, offset, k_batch, v_batch)
+            kv_cache.write_kv(layer_idx, block_id, offset, k_batch, v_batch)
 
             token_idx += tokens_in_block
             pos += tokens_in_block
@@ -534,7 +534,7 @@ class Llama:
             for layer_idx in range(self.config.n_layers):
                 k = k_all[layer_idx, i:i+1]  # [1, n_kv_heads, head_dim]
                 v = v_all[layer_idx, i:i+1]
-                kv_cache.write_kv_batch(layer_idx, block_id, offset, k, v)
+                kv_cache.write_kv(layer_idx, block_id, offset, k, v)
 
         # Advance positions
         for seq_id in seq_ids:
