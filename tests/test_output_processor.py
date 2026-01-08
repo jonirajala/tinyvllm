@@ -174,7 +174,7 @@ class TestOutputProcessorAsync:
         for i in range(3):
             processor.submit(request_id=i, tokens=[i], finish_reason='eos')
 
-        results = processor.drain(timeout=1.0)
+        results = processor.drain()
         assert len(results) == 3
 
         processor.shutdown()
