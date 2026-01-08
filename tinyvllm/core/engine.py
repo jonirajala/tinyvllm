@@ -1,4 +1,5 @@
-"""LLM Engine - Main orchestrator for continuous batching.
+"""
+LLM Engine - Main orchestrator
 
 The engine ties everything together:
 - Model (LLaMA)
@@ -6,35 +7,6 @@ The engine ties everything together:
 - BlockManager (memory allocation)
 - Scheduler (batch composition)
 - Tokenizer (encode/decode)
-
-Phase 4: Integrates BlockManager for memory-aware scheduling and
-block-based KV cache storage.
-
-It runs the main generation loop:
-    while has_requests:
-        batch = scheduler.schedule()
-        outputs = model.forward(batch)
-        scheduler.update(outputs)
-        yield finished_results
-
-Example usage:
-    engine = LLMEngine(model, tokenizer)
-
-    # Add requests (non-blocking)
-    engine.add_request("Write a poem", request_id=0)
-    engine.add_request("Hello world", request_id=1)
-
-    # Process until done
-    for output in engine.run():
-        print(f"Request {output.request_id}: {output.text}")
-
-Or step-by-step:
-    engine.add_request("Hello", request_id=0)
-
-    while engine.has_unfinished():
-        outputs = engine.step()
-        for out in outputs:
-            print(out.text)
 """
 
 from dataclasses import dataclass
@@ -81,21 +53,6 @@ class LLMEngine:
     4. Sample tokens
     5. Return completed generations
 
-    Attributes:
-        model: The LLaMA model
-        tokenizer: Tokenizer for encode/decode
-        scheduler: Scheduler for batch management
-        kv_cache: Shared KVCache for all sequences
-        next_request_id: Counter for request IDs
-
-    Example:
-        engine = LLMEngine(model, tokenizer, max_batch_size=8)
-
-        engine.add_request("Hello", SamplingParams(max_tokens=50))
-        engine.add_request("Write code", SamplingParams(temperature=0.7))
-
-        for output in engine.run():
-            print(output.text)
     """
 
     def __init__(
@@ -162,8 +119,9 @@ class LLMEngine:
             callback=output_callback,
         )
 
-        # JIT decode function (per-engine caching for determinism)
-        self._jit_decode_fn = model.create_jit_decode(block_size=block_size)
+        # JIT decode functions - one per batch size for shape stability
+        # TinyJit requires identical shapes, so we cache separate functions
+        self._jit_decode_fns: Dict[int, object] = {}
         self._jit_max_blocks = 64  # Max blocks for JIT padding
 
     def add_request(
@@ -186,9 +144,10 @@ class LLMEngine:
         if request_id is None:
             request_id = self.next_request_id
             self.next_request_id += 1
+        elif request_id in self.requests: raise ValueError(f"Request ID {request_id} already exists")
+        elif request_id >= self.next_request_id: self.next_request_id = request_id + 1
 
-        if sampling_params is None:
-            sampling_params = SamplingParams()
+        if sampling_params is None: sampling_params = SamplingParams()
 
         request = Request(
             request_id=request_id,
@@ -261,6 +220,7 @@ class LLMEngine:
             if not decode_seqs: break
 
             # Prepare batch
+            batch_size = len(decode_seqs)
             tokens_list = [s.output_tokens[-1] for s in decode_seqs]
             seq_ids = [s.seq_id for s in decode_seqs]
             start_positions = [s.get_len() - 1 for s in decode_seqs]
@@ -269,8 +229,16 @@ class LLMEngine:
             # (eliminates 32x per-layer Python list → Tensor conversions)
             bt_tensor, ctx_tensor = self._prepare_batch_tensors(seq_ids, start_positions)
 
+            # Get or create JIT function for this batch size
+            # TinyJit requires identical shapes, so we cache per batch size
+            if batch_size not in self._jit_decode_fns:
+                self._jit_decode_fns[batch_size] = self.model.create_jit_decode(
+                    block_size=self.block_size
+                )
+            jit_fn = self._jit_decode_fns[batch_size]
+
             # Batched forward pass (JIT-optimized, ~4x faster)
-            input_ids = Tensor(tokens_list).reshape(len(decode_seqs), 1)
+            input_ids = Tensor(tokens_list).reshape(batch_size, 1)
             logits = self.model.decode(
                 input_ids,
                 kv_cache=self.kv_cache,
@@ -279,12 +247,12 @@ class LLMEngine:
                 start_positions=start_positions,
                 block_tables_tensor=bt_tensor,
                 context_lens_tensor=ctx_tensor,
-                jit_fn=self._jit_decode_fn,
+                jit_fn=jit_fn,
                 max_blocks=self._jit_max_blocks,
             )
 
-            # Sample tokens for entire batch at once
-            batch_logits = logits[:, 0, :]  # [batch, vocab_size]
+            # Sample tokens for batch
+            batch_logits = logits[:, 0, :]  # [batch_size, vocab_size]
             params_list = [self.requests[s.request_id].sampling_params for s in decode_seqs]
             seen_tokens_batch = [s.get_all_tokens() for s in decode_seqs]
             next_tokens = sample_tokens(batch_logits, params_list, seen_tokens_batch)
