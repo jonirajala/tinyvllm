@@ -4,7 +4,135 @@ Benchmark results for tinyvllm on Apple Silicon.
 
 ---
 
-# Phase 7.4 (Latest - 2026-01-06)
+# TinyJit Phase (Latest - 2026-01-07)
+
+## Test Configuration
+
+| Parameter | Value |
+|-----------|-------|
+| Device | Apple M4 10-core GPU |
+| Model | TinyLlama 1.1B (FP16) |
+| Model Size | 2.05 GB |
+| Dimensions | 2048 dim, 22 layers, 32 heads |
+| Date | 2026-01-07 |
+
+**Key changes:**
+- Removed custom Metal kernels in favor of pure tinygrad
+- TinyJit compilation for decode loop (4x speedup)
+- Per-engine JIT caching for determinism
+- Simplified codebase (deleted kernels/ folder)
+
+## Theoretical Limits
+
+| Metric | Value |
+|--------|-------|
+| GPU Memory Bandwidth | 120 GB/s |
+| Max tok/s (memory-bound) | 55 tok/s |
+| Min TPOT | 18.3 ms |
+
+---
+
+## Throughput
+
+| Benchmark | Tokens/sec | Utilization | vs Phase 7.4 |
+|-----------|------------|-------------|--------------|
+| Single request | 4.9 | 8.9% | **+188%** |
+| Sequential (5 requests) | 4.7 | 8.7% | **+176%** |
+| Concurrent (5 requests) | 4.7 | 8.6% | **+31%** |
+
+**Concurrent vs Sequential speedup: 1.00x** (JIT warmup dominates)
+
+### Context Length Scaling
+
+| Context Length | Tokens | Time (s) | Tok/sec |
+|----------------|--------|----------|---------|
+| 32 | 10 | 4.03 | 2.5 |
+| 128 | 10 | 7.35 | 1.4 |
+| 256 | 10 | 10.06 | 1.0 |
+| 512 | 10 | 11.25 | 0.9 |
+
+---
+
+## Latency
+
+| Metric | Value | vs Phase 7.4 |
+|--------|-------|--------------|
+| TTFT (Time to First Token) | 670 ms | **-19%** |
+| TPOT (Time Per Output Token) | 238 ms | **-59%** |
+| Decode throughput | 4.2 tok/s | **+147%** |
+| E2E (15 tokens) | 4019 ms | **-55%** |
+
+### Per-Prompt Latency
+
+| Prompt | Tokens | TTFT (ms) | TPOT (ms) | tok/s |
+|--------|--------|-----------|-----------|-------|
+| Hello | 10 | 636 | 237 | 4.2 |
+| How are | 10 | 656 | 247 | 4.1 |
+| Tell me | 10 | 683 | 255 | 3.9 |
+
+### Context Length Scaling
+
+| Context | TTFT (ms) | TPOT (ms) | Decode tok/s |
+|---------|-----------|-----------|--------------|
+| 32 | 1394 | 372 | 2.7 |
+| 128 | 3481 | 350 | 2.9 |
+| 256 | 5703 | 293 | 3.4 |
+| 512 | 6395 | 300 | 3.3 |
+
+---
+
+## Memory
+
+| Metric | Value |
+|--------|-------|
+| Model weights | 2.05 GB |
+| KV memory per token | 22.0 KB |
+
+### KV Cache Scaling
+
+| Sequences | Tokens | KV Cache |
+|-----------|--------|----------|
+| 1 | 8 | 352.0 KB |
+| 2 | 16 | 704.0 KB |
+| 5 | 40 | 1.7 MB |
+
+---
+
+## Scalability
+
+### Throughput vs Concurrent Requests
+
+| Requests | Tok/sec | Efficiency | vs Phase 7.4 |
+|----------|---------|------------|--------------|
+| 1 | 3.4 | 100.0% | **+113%** |
+| 2 | 4.1 | 60.8% | **+86%** |
+| 4 | 4.7 | 34.8% | **+62%** |
+
+**Best throughput: 4.7 tok/s at 4 concurrent requests**
+
+---
+
+## TinyJit Phase vs Phase 7.4 Summary
+
+| Metric | Phase 7.4 | TinyJit | Change |
+|--------|-----------|---------|--------|
+| Single request | 1.7 tok/s | 4.9 tok/s | **+188%** |
+| Concurrent (5) | 3.6 tok/s | 4.7 tok/s | **+31%** |
+| TTFT | 828 ms | 670 ms | **-19%** |
+| TPOT | 574 ms | 238 ms | **-59%** |
+| Decode throughput | 1.7 tok/s | 4.2 tok/s | **+147%** |
+| Best scalability | 2.9 tok/s | 4.7 tok/s | **+62%** |
+| E2E (15 tokens) | 8857 ms | 4019 ms | **-55%** |
+
+**Key insights:**
+- TinyJit provides massive decode speedup (2.4x TPOT reduction)
+- Single request throughput nearly tripled (1.7 → 4.9 tok/s)
+- Concurrent speedup less dramatic because JIT warmup amortizes better with batching
+- Pure tinygrad approach simpler and faster than custom Metal kernels
+
+---
+
+# Phase 7.4 (Previous - 2026-01-06)
 
 ## Test Configuration
 

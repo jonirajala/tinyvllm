@@ -1,9 +1,9 @@
 
 # tinyvllm Implementation Roadmap (Priority-Ordered)
 
-**Current Status:** 1.7 tok/s single / 3.6 tok/s batched vs 55 tok/s theoretical (6.6% utilization)
-**Progress:** Phase 8.3 complete (Async Output Processing: CPU/GPU overlap)
-**Primary Bottleneck:** Python→GPU scheduling overhead, NOT kernel speed
+**Current Status:** ~4 tok/s batched with TinyJit optimization
+**Progress:** Phase 8.3 complete + JIT decode working (4x speedup)
+**Architecture:** Pure tinygrad with TinyJit compilation (no custom kernels)
 
 ---
 
@@ -37,9 +37,10 @@
 - Logical → physical block mapping
 - Allocate on demand, free when done
 
-2.3 Paged Attention Kernel ✅
-- Gather K,V from scattered blocks
+2.3 Paged Attention (tinygrad) ✅
+- Gather K,V from scattered blocks using tinygrad ops
 - Compute attention with block tables
+- No custom kernels needed
 
 ---
 
@@ -64,7 +65,7 @@
 
 4.1 Block Tensors ✅
 - Pre-allocated block tensors (tinygrad compatible)
-- Tensor.stack() for gathering blocks
+- Tensor indexing for gathering blocks
 
 4.2 BlockManager Integration ✅
 - Connect to Scheduler (can_allocate checks)
@@ -75,218 +76,111 @@
 
 ---
 
-## Phase 5: Custom Metal Kernel ✅
+## Phase 5: Custom Metal Kernels ❌ REMOVED
 
-5.1 Metal Kernel ✅
-- Fused paged attention (gather + matmul in one kernel)
-- Direct block addressing without copy
-- tinygrad MetalProgram API
+**Status:** Removed in favor of tinygrad + TinyJit approach
 
-5.2 Kernel Integration ✅
-- Auto-detect backend
-- Fallback to portable Tensor.stack()
+**History:**
+- Originally implemented fused paged attention Metal kernels
+- Custom kernels achieved good standalone performance
+- However, TinyJit + pure tinygrad ops proved faster overall:
+  - Better integration with tinygrad's lazy evaluation
+  - No Python↔Metal synchronization overhead
+  - JIT compiles entire decode loop into single optimized kernel
 
----
+**Deleted files:**
+- `paged_decode_attention_metal.py`
+- `flash_prefill_attention_metal.py`
+- Entire `tinyvllm/kernels/` folder
 
-## Phase 6: Metal Kernel Optimizations ✅ (Partial)
-
-6.1 SIMD Optimizations ✅
-- 32-thread threadgroups (single simdgroup)
-- SIMD shuffle reductions (simd_sum)
-- simd_broadcast_first for exp()
-
-6.2 Memory Access ✅
-- Vectorized float4 loads
-- FP16 support
-
-6.3 Online Softmax ✅
-- Single-pass attention (vs two-pass)
-- Better memory locality
-
-6.4 Attempted but Removed ❌
-- Buffer pooling ❌ - tensors can't be recycled
-- simdgroup_async_copy ❌ - API deprecated by Apple
+**Current approach:** Pure tinygrad attention ops compiled via TinyJit
 
 ---
 
-## Phase 7: Critical Optimizations (10-20x potential)
+## Phase 6: Metal Kernel Optimizations ❌ SUPERSEDED
 
-7.1 TinyJit for Decode Loop ❌ REMOVED
-**Impact:** Incorrect output | **Status:** Removed
-- **Original claim:** 1.5-2x speedup with @TinyJit decorator
-- **Reality:** JIT produced gibberish output due to fundamental design flaw
+**Status:** No longer applicable - custom kernels removed
 
-**Why JIT didn't work:**
-1. **The bug:** K/V for ALL layers were computed from raw embedding, not updated hidden state
-   - Each transformer layer should compute K/V from h after previous layers processed it
-   - JIT version computed all K/V upfront from initial embedding (before any layer processing)
-   - Result: K/V contained wrong values, Q was correct → attention produced garbage
+These optimizations (SIMD, online softmax, etc.) were for the custom Metal kernels.
+With TinyJit approach, tinygrad handles low-level optimization automatically.
 
-2. **Why it seemed faster:** The broken version did less work (wrong, but fast)
+---
 
-3. **The fix attempt:** Compute K/V layer-by-layer with proper hidden state updates
-   - This made output correct but required writing to KV cache inside the JIT'd function
-   - @TinyJit doesn't work with dynamic tensor writes (cache updates)
-   - Result: JIT benefit eliminated, actually 1.24x SLOWER than non-JIT
+## Phase 7: Critical Optimizations
 
-4. **Conclusion:** Removed JIT entirely - can't have both correctness and JIT speedup
-   - Deleted: `jit_decode.py`, `paged_attention_jit.py`, tests and benchmarks
-   - Files removed from codebase completely
+7.1 TinyJit for Decode Loop ✅ WORKING
+**Impact:** 4x speedup | **Status:** Completed
+
+**Implementation:**
+- `@TinyJit` decorator compiles entire decode forward pass
+- JIT function created per-engine (not cached on model) for determinism
+- Factory pattern: `model.create_jit_decode()` returns fresh JIT function
+- Engine stores and reuses its own JIT instance
+
+**Key insight:** JIT must be per-engine, not per-model:
+- Same model reused across multiple engines needs independent JIT state
+- Otherwise, different engines interfere with each other's cached graphs
+- Solution: `LLMEngine.__init__` creates its own `_jit_decode_fn`
+
+**Files:** `tinyvllm/model/llama.py`, `tinyvllm/core/engine.py`
 
 7.2 Weight Quantization INT8 ❌
-**Impact:** Theoretical 2x, Actual 4x SLOWER | **Status:** Investigated, not viable with current approach
+**Impact:** Theoretical 2x, Actual 4x SLOWER | **Status:** Not viable
 
 **Why it doesn't work:**
-1. **Unfused approach (tinygrad ops):** `w_int8.cast(fp16) * scale` creates separate kernels for cast, multiply, then matmul. Extra memory round-trips make it 3x slower than FP16.
-
-2. **Fused Metal kernel:** We implemented a custom kernel that loads INT8, dequantizes in registers, computes matmul. The kernel itself is 6x faster than FP16 in isolation.
-
-3. **Python overhead kills it:** Custom kernels don't integrate with tinygrad's lazy evaluation. Each of 155 linear layers requires:
-   - Input tensor realize: ~1.75ms
-   - Output allocation: ~0.48ms
-   - Buffer fetching: ~0.36ms
-   - Kernel execution: ~0.23ms (fast!)
-   - **Total: ~2.8ms/layer × 155 layers = 434ms/token**
-
-4. **Result:** 0.30 tok/s INT8 vs 1.22 tok/s FP16 = 4x slower
-
-**What would fix it:**
-- Native tinygrad INT8 matmul support (fused with lazy graph)
-- Or: Write entire model forward pass as single Metal kernel (impractical)
+1. Custom kernels can't integrate with tinygrad lazy graph
+2. Each layer needs realize() calls that kill performance
+3. Would need native tinygrad INT8 support
 
 7.3 Multi-Step Scheduling ✅
 **Impact:** Minimal with simple scheduler, future-proofs for complex scheduling | **Status:** Completed
 - Added `num_scheduler_steps` parameter to LLMEngine (default=1)
 - GPU runs N decode iterations per step() call, amortizing scheduler overhead
-- After N steps, checks for finished sequences and new requests
-- Benchmark results: With current simple scheduler, <5% improvement (scheduler not the bottleneck)
-- Future value: Will help when we add priority scheduling, preemption, prefix caching, SLA-based scheduling
-- Trade-off: higher TTFT at low load (N=1 for latency, N=4+ for throughput)
 - Usage: `--num-scheduler-steps 4` or `LLMEngine(..., num_scheduler_steps=4)`
 
 7.4 Reduce Python→GPU Copies ✅
 **Impact:** ~15% speedup | **Status:** Completed
-- Build block_tables and context_lens tensors ONCE per decode step (not 22x per layer)
-- Added `decode_attention_with_tensors()` for direct tensor path
-- Benchmark: 1.52 tok/s (optimized) vs 1.32 tok/s (baseline) = 15% improvement
-- Files: `engine.py`, `llama.py`, `attention_utils.py`
-- Note: Less than expected 2-3x because other bottlenecks dominate (kernel execution, weight reads)
+- Build block_tables and context_lens tensors ONCE per decode step (not per layer)
+- Tensors passed directly to attention functions
 
 ---
 
-## Phase 8: Performance Tuning (30-50% additional)
+## Phase 8: Performance Tuning
 
 8.1 Flash Attention for Prefill ✅
 **Impact:** 1.4-2.2x prefill speedup | **Status:** Completed
-**Prerequisite:** Online softmax ✅ (completed in 6.3)
 - Tiled attention with online softmax for prefill phase
-- Process Q, K, V in 8x8 tiles
-- Custom Metal kernel with threadgroup memory for tile storage
-- O(1) memory regardless of sequence length (vs O(n²))
-- Enables longer context windows (16K+)
-- **Benchmark results (isolated attention):**
-  - 32 tokens: 1.59x speedup (2.76ms → 1.73ms)
-  - 64 tokens: 1.46x speedup (2.79ms → 1.92ms)
-  - 128 tokens: 1.39x speedup (2.74ms → 1.97ms)
-  - 256 tokens: 2.22x speedup (4.16ms → 1.87ms)
-  - 512 tokens: 1.62x speedup (3.07ms → 1.89ms)
-- **Files:** `kernels/flash_attention_metal.py`, `kernels/flash_attention_tinygrad.py`, `attention_utils.py`
-- **Features:** GQA support, causal masking, auto-selects Metal or tinygrad fallback
+- Pure tinygrad implementation (no custom Metal kernel)
+- Process Q, K, V in tiles for memory efficiency
+- GQA support, causal masking
+- **Files:** `tinyvllm/model/llama.py` (integrated directly)
 
 8.2 Pre-allocated Buffers
-**Impact:** 10-20% | **Status:** Not started / Already done for custom metal kernel
+**Impact:** 10-20% | **Status:** Not started
 - Pre-allocate decode input/output buffers at engine init
 - Reuse instead of Tensor.zeros() each step
-- Note: Already done for custom metal kernel
 
 8.3 Async Output Processing ✅
-**Impact:** ~3% measured (8-10% theoretical) | **Status:** Completed
-- Detokenize previous step while GPU computes current step ← overlap CPU/GPU
+**Impact:** ~3% measured | **Status:** Completed
+- Detokenize previous step while GPU computes current step
 - Background thread with queue for pending outputs
-- Return results via callback or poll
-- **Benchmark:** 4.25 tok/s (sync) → 4.37 tok/s (async) = +2.9% (8 requests, 100 tokens each)
-- **Note:** SentencePiece decode is very fast (~μs), so overlap benefit is small. Bigger gains expected with slower tokenizers or in server mode where callbacks can process results while GPU continues.
-- **Files:** `tinyvllm/engine/output_processor.py`, `tinyvllm/engine/engine.py`
-- **Usage:** `LLMEngine(..., async_output=True)` or with callback: `LLMEngine(..., async_output=True, output_callback=fn)`
-- **New methods:** `poll_outputs()` for manual polling, `shutdown()` for cleanup
+- **Files:** `tinyvllm/core/output_processor.py`, `tinyvllm/core/engine.py`
+- **Usage:** `LLMEngine(..., async_output=True)`
 
 8.4 Object Pooling (CPU)
 **Impact:** 10-15% | **Status:** Not started
 - Pre-allocate Request, Sequence, SchedulerOutput objects
-- Reuse instead of alloc/free each step ← vLLM saw 24% improvement
-- Add .reset() method to clear state
+- Reuse instead of alloc/free each step
 
 8.5 Weight Quantization INT4 ❌
-**Impact:** 2x more (4x total vs FP16) | **Status:** Won't work (same issue as INT8)
-- Same problem as INT8: custom kernels can't integrate with tinygrad lazy graph
-- Each layer needs realize() calls that kill performance
+**Impact:** Not viable | **Status:** Same issue as INT8
+- Custom kernels can't integrate with tinygrad lazy graph
 - Would need native tinygrad INT4 support
-- Per-group scales (group_size=128 typical)
-- GPTQ/AWQ style quantization
 
 8.6 Sampling Optimizations
 **Impact:** 5-10% remaining | **Status:** Partially done
-- ✅ Top-k/top-p moved to CPU (faster than tinygrad's GPU topk which uses O(n log² n) bitonic sort)
-- Greedy fast path could help slightly
-- Batched sampling across sequences (currently single token at a time)
-- Remove remaining .realize().tolist() sync points
-
-8.7 Deferred KV Writes with Metal Kernel Support
-**Impact:** 13x faster KV writes (47ms → 3.5ms) | **Status:** Requires Metal kernel update
-- **Goal:** Reduce KV cache write overhead by batching writes across all 22 layers
-- **Approach:** Defer K/V writes during forward pass, collect all layers' K/V, write once at end
-- **Blocker:** Metal kernel doesn't support current_k/current_v params
-  - Without it, falls back to tinygrad kernel (6.7x slower than Metal)
-  - Net result with tinygrad fallback: 141ms slower per token (save 43ms writes, lose 185ms attention)
-- **Solution:** Update Metal kernel to accept current_k/current_v buffers
-  - Add extra buffer parameters to kernel
-  - Concatenate current K/V with cached K/V in-kernel before attention
-- **Prerequisite:** Unified KVCache tensor structure
-
-8.8 Reduce Tinygrad Operations per Forward Pass
-**Impact:** Potentially significant | **Status:** Not started
-- Each tinygrad tensor operation builds a lazy graph node
-- More ops = more graph overhead, even if kernels are fast
-- Investigate fusing multiple ops into single custom kernels
-- Profile with DEBUG=4 to see what tinygrad auto-fuses
-- Consider rewriting hot paths as single Metal kernels (like attention)
-- Trade-off: Custom kernels lose tinygrad's lazy evaluation benefits
-
-8.9 Decode Kernel: Block-wise Parallelization
-**Impact:** Large for long contexts | **Status:** Not started
-- Current decode kernel has O(ctx_len) sequential loop per head
-- Each head processes tokens one at a time (memory bandwidth bound)
-- **Goal:** Parallelize across tokens with block-wise reductions
-- **Approach:**
-  - Split context into blocks (e.g., 64 tokens each)
-  - Each threadgroup processes one block, computes partial softmax
-  - Final reduction across blocks to combine partial results
-  - Similar to vLLM's PagedAttention V2 algorithm
-- **Complexity:** High - requires partial softmax accumulation across blocks
-- **Prerequisite:** Verify tinygrad JIT doesn't already beat this
-
-8.10 Decode Kernel: K/V Prefetching & Unrolling
-**Impact:** Medium | **Status:** Not started
-- Current kernel loads one K/V position per iteration
-- Apple GPUs benefit from coalesced memory access patterns
-- **Goal:** Process small window of positions per iteration
-- **Approach:**
-  - Unroll inner loop to process 2-4 tokens at once
-  - Use threadgroup memory to stage K/V tiles
-  - Prefetch next positions while computing current
-- **Trade-off:** More register pressure vs better memory throughput
-
-8.11 Prefill Kernel: Double-Buffering
-**Impact:** Medium | **Status:** Not started
-- Current prefill kernel: load tile → barrier → compute → barrier
-- Memory latency not hidden during compute phase
-- **Goal:** Overlap loading next tile while computing current tile
-- **Approach:**
-  - Allocate two K/V tile buffers (K0/V0, K1/V1)
-  - While computing on buffer 0, load next tile into buffer 1
-  - Swap buffers each iteration (software pipelining)
-- **Trade-off:** 2x threadgroup memory usage
-- **Note:** TILE_KV=16 already hurt performance, so memory pressure is a concern
+- ✅ Top-k/top-p moved to CPU (faster than tinygrad's GPU topk)
+- Batched sampling across sequences could help slightly
 
 ---
 
@@ -297,18 +191,16 @@
 - FastAPI or simple HTTP server
 - POST /generate endpoint
 - Server-sent events (SSE) for streaming
-- Token-by-token streaming
 
 9.2 OpenAI API Compatibility
 **Impact:** Drop-in replacement | **Status:** Not started
 - POST /v1/completions
 - POST /v1/chat/completions
-- Response format matching
 
 9.3 Prefill Optimization
 **Status:** Not started
-- Chunked prefill (don't block on long prompts) vLLM does this - singel decode prefill loop
-- Batched prefill (process multiple prefill sequences together) 
+- Chunked prefill (don't block on long prompts)
+- Batched prefill (process multiple prefill sequences together)
 
 ---
 
@@ -316,23 +208,18 @@
 
 10.1 Speculative Decoding
 **Impact:** 2-3x throughput | **Status:** Not started
-- Draft model integration (small fast model proposes tokens)
+- Draft model integration
 - Parallel verification with main model
-- Token acceptance/rejection logic
-- Requires draft model weights
 
 10.2 Prefix Caching
-**Impact:** Variable (use-case dependent) | **Status:** Not started
+**Impact:** Variable | **Status:** Not started
 - Hash prompt prefixes
 - Reuse KV cache for common prefixes
-- Cache eviction policy (LRU)
-- Cache hit/miss tracking
 
 10.3 KV Cache Quantization
 **Impact:** 2-4x memory reduction | **Status:** Not started
 - Support int8/float16 KV cache storage
-- Dequantization in attention kernel
-- Enables longer sequences with same memory
+- Enables longer sequences
 
 10.4 Kernel Fusion
 **Impact:** 10-20% | **Status:** Not started
@@ -340,33 +227,19 @@
 - RoPE + Q/K projection
 - Verify what tinygrad auto-fuses with DEBUG=4
 
-10.5 Generation Control
-**Status:** Not started
-- Stop string matching (beyond EOS token)
-- Constrained decoding (JSON schema, grammar)
-- Logit processors plugin system
-
-10.6 Metrics & Monitoring
-**Status:** Not started
-- Per-step timing (prefill time, decode time, sample time)
-- Memory profiling (used, free, fragmentation)
-- Cache hit rate (for prefix caching)
-
 ---
 
 ## Phase 11: Platform Expansion
 
-11.1 CUDA Kernel
-**Impact:** NVIDIA platform support | **Status:** Not started
-- Fused paged attention for CUDA
-- Use tinygrad's CUDAProgram API
-- CUDA graphs (capture and replay decode loop)
+11.1 CUDA Support
+**Impact:** NVIDIA platform | **Status:** Not started
+- tinygrad already supports CUDA backend
+- May need CUDA-specific optimizations
 
 11.2 Multi-GPU
 **Impact:** Large model scaling | **Status:** Not started
-- Tensor parallelism (split layers across GPUs)
-- Sequence parallelism (different sequences on different GPUs)
-- Pipeline parallelism (different layers on different GPUs)
+- Tensor parallelism
+- Pipeline parallelism
 
 ---
 
@@ -383,64 +256,80 @@
 12.3 CPU Swap
 **Status:** Not started
 - Move blocks to CPU when GPU full
-- Swap back when needed
 
 ---
 
 ## Deferred/Not Recommended ❌
 
-### simdgroup_async_copy ❌
-**Status:** Research complete - NOT RECOMMENDED
-- API deprecated/blocked by Apple (macOS 26 Beta 4 disabled __asm workaround)
-- Causes undefined behavior with multi-simdgroup sync
-- Alternatives: standard tiled attention, simd_matrix intrinsics
+### Custom Metal Kernels ❌
+**Status:** Removed
+- TinyJit + pure tinygrad proved faster
+- Better integration with lazy evaluation
+- Less Python↔Metal synchronization overhead
+
+### Weight Quantization (INT8/INT4) ❌
+**Status:** Not viable
+- Custom kernels can't integrate with tinygrad lazy graph
+- Would need native tinygrad quantization support
 
 ### Buffer Pooling ❌
 **Status:** Removed
-- Tensors returned to caller can't be recycled back to pool
-- Tinygrad's lazy evaluation already handles kernel graph caching
-
-### Tiled Attention for Decode ❌
-**Status:** Deferred
-- Decode is memory-bandwidth-bound, not compute-bound
-- Minimal gain from tiling in decode phase
-- Focus on prefill (9.1) where tiling helps
+- Tensors returned to caller can't be recycled
+- Tinygrad's lazy evaluation handles caching
 
 ---
 
 ## Quick Reference
 
 ```
-✅ COMPLETED (Phase 1-8.3):
-   1: Foundation
-   2: Paged Attention
-   3: Continuous Batching
-   4: Block-based KVCache
-   5: Custom Metal Kernel
-   6: Metal Kernel Optimizations (online softmax, SIMD)
-   7.3: Multi-step scheduling    → <5% (future-proofs) ✅
-   7.4: Reduce Python→GPU copies → 15% ✅
-   8.1: Flash Attention prefill  → 1.4-2.2x ✅
-   8.3: Async output processing  → ~3% ✅
+✅ COMPLETED:
+   Phase 1: Foundation
+   Phase 2: Paged Attention (tinygrad ops)
+   Phase 3: Continuous Batching
+   Phase 4: Block-based KVCache
+   Phase 7.1: TinyJit decode loop     → 4x speedup ✅
+   Phase 7.3: Multi-step scheduling   → future-proofs ✅
+   Phase 7.4: Reduce Python→GPU copies → 15% ✅
+   Phase 8.1: Flash Attention prefill → 1.4-2.2x ✅
+   Phase 8.3: Async output processing → ~3% ✅
 
-🎯 NEXT (Phase 8 - Performance Tuning):
-   8.2, 8.4-8.6: Buffers, object pooling, INT4, sampling
-   8.7: Deferred KV writes (needs Metal kernel update)
-   8.8: Reduce tinygrad ops per forward pass
+🎯 NEXT PRIORITIES:
+   8.2: Pre-allocated buffers
+   8.4: Object pooling
+   8.6: Sampling optimizations
+   9.1: API Server
 
 📦 FEATURES (Phase 9):
    9.1: API Server
    9.2: OpenAI compatibility
+   9.3: Prefill optimization
 
 🔮 ADVANCED (Phase 10-12):
    10: Speculative decoding, prefix caching, KV quantization
-   11: CUDA kernel, multi-GPU
+   11: CUDA support, multi-GPU
    12: Memory management (eviction, defrag, swap)
 
-❌ SKIP:
-   simdgroup_async_copy (deprecated)
-   Buffer pooling (doesn't work)
-   7.1: TinyJit (K/V computed from wrong hidden state, can't fix without losing JIT benefit)
-   7.2: INT8 quantization (Python overhead makes it 4x slower)
+❌ REMOVED/SKIPPED:
+   Phase 5-6: Custom Metal kernels (replaced by TinyJit)
+   7.2/8.5: INT8/INT4 quantization (not viable)
+   Buffer pooling (doesn't work with tinygrad)
 ```
 
+## Code Structure
+
+```
+tinyvllm/
+├── core/           # Engine, scheduler, KV cache, sampling
+│   ├── engine.py   # LLMEngine with JIT decode
+│   ├── scheduler.py
+│   ├── kv_cache.py
+│   ├── block_manager.py
+│   ├── sampling.py
+│   ├── sequence.py
+│   └── output_processor.py
+├── model/          # LLaMA model with attention
+│   ├── llama.py    # Model + paged/flash attention
+│   ├── weights.py
+│   └── tokenizer.py
+└── main.py         # CLI entry point
+```
