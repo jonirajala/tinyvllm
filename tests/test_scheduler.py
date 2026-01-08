@@ -3,8 +3,14 @@
 import pytest
 
 from tinyvllm.core.scheduler import Scheduler
+from tinyvllm.core.block_manager import BlockManager
 from tinyvllm.core.sequence import Request, Sequence, SequenceStatus, SchedulerOutput
 from tinyvllm.core.sampling import SamplingParams
+
+
+def make_block_manager() -> BlockManager:
+    """Helper to create a test block manager with plenty of blocks."""
+    return BlockManager(num_gpus=1, blocks_per_gpu=100, block_size=16)
 
 
 def make_request(request_id: int, prompt_tokens=None) -> Request:
@@ -24,7 +30,8 @@ class TestSchedulerInit:
 
     def test_default_init(self):
         """Test default initialization."""
-        scheduler = Scheduler()
+        bm = make_block_manager()
+        scheduler = Scheduler(max_batch_size=8, block_manager=bm)
         assert scheduler.max_batch_size == 8
         assert scheduler.max_seq_len == 2048
         assert scheduler.waiting == []
@@ -33,7 +40,8 @@ class TestSchedulerInit:
 
     def test_custom_init(self):
         """Test custom initialization."""
-        scheduler = Scheduler(max_batch_size=4, max_seq_len=1024)
+        bm = make_block_manager()
+        scheduler = Scheduler(max_batch_size=4, block_manager=bm, max_seq_len=1024)
         assert scheduler.max_batch_size == 4
         assert scheduler.max_seq_len == 1024
 
@@ -43,7 +51,7 @@ class TestAddRequest:
 
     def test_add_single_request(self):
         """Test adding a single request."""
-        scheduler = Scheduler()
+        scheduler = Scheduler(max_batch_size=8, block_manager=make_block_manager())
         req = make_request(0)
 
         scheduler.add_request(req)
@@ -53,7 +61,7 @@ class TestAddRequest:
 
     def test_add_multiple_requests_fcfs(self):
         """Test requests are added in FCFS order."""
-        scheduler = Scheduler()
+        scheduler = Scheduler(max_batch_size=8, block_manager=make_block_manager())
         req1 = make_request(1)
         req2 = make_request(2)
         req3 = make_request(3)
@@ -73,25 +81,25 @@ class TestHasUnfinished:
 
     def test_empty_scheduler(self):
         """Test empty scheduler has no unfinished."""
-        scheduler = Scheduler()
+        scheduler = Scheduler(max_batch_size=8, block_manager=make_block_manager())
         assert not scheduler.has_unfinished()
 
     def test_with_waiting(self):
         """Test has_unfinished with waiting requests."""
-        scheduler = Scheduler()
+        scheduler = Scheduler(max_batch_size=8, block_manager=make_block_manager())
         scheduler.add_request(make_request(0))
         assert scheduler.has_unfinished()
 
     def test_with_running(self):
         """Test has_unfinished with running sequences."""
-        scheduler = Scheduler()
+        scheduler = Scheduler(max_batch_size=8, block_manager=make_block_manager())
         scheduler.add_request(make_request(0))
-        scheduler.schedule()  # Move to running
+        scheduler.schedule()
         assert scheduler.has_unfinished()
 
     def test_after_all_finished(self):
         """Test has_unfinished after all complete."""
-        scheduler = Scheduler()
+        scheduler = Scheduler(max_batch_size=8, block_manager=make_block_manager())
         scheduler.add_request(make_request(0))
         batch = scheduler.schedule()
         seq = batch.scheduled_seqs[0]
@@ -105,13 +113,13 @@ class TestSchedule:
 
     def test_schedule_empty(self):
         """Test schedule with no requests."""
-        scheduler = Scheduler()
+        scheduler = Scheduler(max_batch_size=8, block_manager=make_block_manager())
         batch = scheduler.schedule()
         assert batch.scheduled_seqs == []
 
     def test_schedule_single_request(self):
         """Test schedule with single request."""
-        scheduler = Scheduler()
+        scheduler = Scheduler(max_batch_size=8, block_manager=make_block_manager())
         req = make_request(0, [1, 2, 3])
         scheduler.add_request(req)
 
@@ -125,7 +133,7 @@ class TestSchedule:
 
     def test_schedule_moves_to_running(self):
         """Test schedule moves request to running."""
-        scheduler = Scheduler()
+        scheduler = Scheduler(max_batch_size=8, block_manager=make_block_manager())
         scheduler.add_request(make_request(0))
 
         batch = scheduler.schedule()
@@ -137,7 +145,7 @@ class TestSchedule:
 
     def test_schedule_includes_running_sequences(self):
         """Test schedule includes already running sequences."""
-        scheduler = Scheduler()
+        scheduler = Scheduler(max_batch_size=8, block_manager=make_block_manager())
         scheduler.add_request(make_request(0))
         scheduler.add_request(make_request(1))
 
@@ -156,7 +164,7 @@ class TestSchedule:
 
     def test_schedule_respects_max_batch_size(self):
         """Test schedule respects max_batch_size."""
-        scheduler = Scheduler(max_batch_size=2)
+        scheduler = Scheduler(max_batch_size=2, block_manager=make_block_manager())
         for i in range(5):
             scheduler.add_request(make_request(i))
 
@@ -168,7 +176,7 @@ class TestSchedule:
 
     def test_schedule_increments_seq_id(self):
         """Test schedule increments seq_id for each new sequence."""
-        scheduler = Scheduler()
+        scheduler = Scheduler(max_batch_size=8, block_manager=make_block_manager())
         scheduler.add_request(make_request(0))
         scheduler.add_request(make_request(1))
         scheduler.add_request(make_request(2))
@@ -181,7 +189,7 @@ class TestSchedule:
 
     def test_schedule_adds_waiting_when_room(self):
         """Test schedule adds waiting requests when batch has room."""
-        scheduler = Scheduler(max_batch_size=4)
+        scheduler = Scheduler(max_batch_size=4, block_manager=make_block_manager())
 
         # Add first request, schedule it
         scheduler.add_request(make_request(0))
@@ -202,15 +210,11 @@ class TestSchedule:
 
 
 class TestUpdate:
-    """Tests for update method.
-
-    Note: Tokens are now appended directly to sequences in engine.step().
-    The update() method only handles finished sequence cleanup.
-    """
+    """Tests for update method."""
 
     def test_update_removes_finished(self):
         """Test update removes finished sequences from running."""
-        scheduler = Scheduler()
+        scheduler = Scheduler(max_batch_size=8, block_manager=make_block_manager())
         scheduler.add_request(make_request(0))
         batch = scheduler.schedule()
         seq = batch.scheduled_seqs[0]
@@ -224,7 +228,7 @@ class TestUpdate:
 
     def test_update_sets_finished_status(self):
         """Test update sets FINISHED status."""
-        scheduler = Scheduler()
+        scheduler = Scheduler(max_batch_size=8, block_manager=make_block_manager())
         scheduler.add_request(make_request(0))
         batch = scheduler.schedule()
         seq = batch.scheduled_seqs[0]
@@ -236,7 +240,7 @@ class TestUpdate:
 
     def test_update_partial_finish(self):
         """Test update with some sequences finishing."""
-        scheduler = Scheduler()
+        scheduler = Scheduler(max_batch_size=8, block_manager=make_block_manager())
         scheduler.add_request(make_request(0))
         scheduler.add_request(make_request(1))
         batch = scheduler.schedule()
@@ -257,13 +261,13 @@ class TestUpdate:
 
     def test_update_no_finished(self):
         """Test update with no finished sequences."""
-        scheduler = Scheduler()
+        scheduler = Scheduler(max_batch_size=8, block_manager=make_block_manager())
         scheduler.add_request(make_request(0))
         batch = scheduler.schedule()
         seq = batch.scheduled_seqs[0]
 
         seq.append_token(100)
-        scheduler.update([])  # No finished
+        scheduler.update([])
 
         assert seq.seq_id in scheduler.running
         assert seq.output_tokens == [100]
@@ -274,13 +278,13 @@ class TestGetNumWaitingRunning:
 
     def test_initial_counts(self):
         """Test initial counts are zero."""
-        scheduler = Scheduler()
+        scheduler = Scheduler(max_batch_size=8, block_manager=make_block_manager())
         assert scheduler.get_num_waiting() == 0
         assert scheduler.get_num_running() == 0
 
     def test_counts_after_add(self):
         """Test counts after adding requests."""
-        scheduler = Scheduler()
+        scheduler = Scheduler(max_batch_size=8, block_manager=make_block_manager())
         scheduler.add_request(make_request(0))
         scheduler.add_request(make_request(1))
 
@@ -289,7 +293,7 @@ class TestGetNumWaitingRunning:
 
     def test_counts_after_schedule(self):
         """Test counts after scheduling."""
-        scheduler = Scheduler()
+        scheduler = Scheduler(max_batch_size=8, block_manager=make_block_manager())
         scheduler.add_request(make_request(0))
         scheduler.add_request(make_request(1))
         scheduler.schedule()
@@ -299,7 +303,7 @@ class TestGetNumWaitingRunning:
 
     def test_counts_after_finish(self):
         """Test counts after finishing."""
-        scheduler = Scheduler()
+        scheduler = Scheduler(max_batch_size=8, block_manager=make_block_manager())
         scheduler.add_request(make_request(0))
         batch = scheduler.schedule()
         seq = batch.scheduled_seqs[0]
@@ -315,7 +319,7 @@ class TestAbortRequest:
 
     def test_abort_waiting_request(self):
         """Test aborting a waiting request."""
-        scheduler = Scheduler()
+        scheduler = Scheduler(max_batch_size=8, block_manager=make_block_manager())
         scheduler.add_request(make_request(0))
         scheduler.add_request(make_request(1))
 
@@ -327,7 +331,7 @@ class TestAbortRequest:
 
     def test_abort_running_request(self):
         """Test aborting a running request."""
-        scheduler = Scheduler()
+        scheduler = Scheduler(max_batch_size=8, block_manager=make_block_manager())
         scheduler.add_request(make_request(0))
         scheduler.schedule()
 
@@ -338,7 +342,7 @@ class TestAbortRequest:
 
     def test_abort_nonexistent_request(self):
         """Test aborting a request that doesn't exist."""
-        scheduler = Scheduler()
+        scheduler = Scheduler(max_batch_size=8, block_manager=make_block_manager())
         scheduler.add_request(make_request(0))
 
         result = scheduler.abort_request(999)
@@ -348,7 +352,7 @@ class TestAbortRequest:
 
     def test_abort_already_finished(self):
         """Test aborting already finished request returns False."""
-        scheduler = Scheduler()
+        scheduler = Scheduler(max_batch_size=8, block_manager=make_block_manager())
         scheduler.add_request(make_request(0))
         batch = scheduler.schedule()
         seq = batch.scheduled_seqs[0]
@@ -365,7 +369,7 @@ class TestFullWorkflow:
 
     def test_single_request_lifecycle(self):
         """Test complete lifecycle of a single request."""
-        scheduler = Scheduler()
+        scheduler = Scheduler(max_batch_size=8, block_manager=make_block_manager())
 
         # Add request
         req = make_request(0, [1, 2, 3])
@@ -394,7 +398,7 @@ class TestFullWorkflow:
 
     def test_multiple_requests_lifecycle(self):
         """Test multiple requests with staggered completion."""
-        scheduler = Scheduler(max_batch_size=3)
+        scheduler = Scheduler(max_batch_size=3, block_manager=make_block_manager())
 
         # Add 3 requests
         for i in range(3):
