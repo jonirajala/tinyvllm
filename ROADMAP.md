@@ -29,10 +29,17 @@ Pool and reuse Python objects:
 
 **Note:** GenerationOutput intentionally not pooled - it's a return value that leaves the engine boundary. Callers may store references (e.g., `list(engine.run())`), so recycling would corrupt their data.
 
-### 1.3 Batched Sampling
+### 1.3 Batched Sampling ✅ DONE
 **Impact:** 5-10% | **Effort:** Low
 
 Sample all sequences in batch together instead of loop.
+
+**Implemented:** vLLM-style batched sampling in `sampling.py`:
+- `SamplingMetadata` class aggregates params with optimization flags
+- Batched temperature scaling: single tensor div operation
+- Batched Gumbel-max: single argmax for all sequences
+- Mixed greedy/random combining via `Tensor.where()`
+- Conditional fast paths (skip ops when all params uniform)
 
 ### 1.4 Incremental Block Allocation
 **Impact:** 30-50% memory savings | **Effort:** Low | **Source:** [vLLM PagedAttention](https://blog.vllm.ai/2025/09/05/anatomy-of-vllm.html)
@@ -265,7 +272,7 @@ When OOM:
 QUICK WINS (do first):
 ├── 1.1 Buffer reuse                     ~15% ✅ DONE
 ├── 1.2 Object pooling                   ~10% ✅ DONE
-├── 1.3 Batched sampling                 ~5%
+├── 1.3 Batched sampling                 ~5% ✅ DONE
 └── 1.4 Incremental block allocation     ~40% memory
 
 HIGH IMPACT (do next):

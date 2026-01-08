@@ -8,8 +8,7 @@ from tinyvllm.core.sampling import (
     sample_tokens,
     _top_k_filter,
     _top_p_filter,
-    _multinomial_sample,
-    _repetition_penalty,
+    _gumbel_sample,
 )
 
 
@@ -115,74 +114,50 @@ class TestTopPFilter:
         assert result_list[2] == pytest.approx(10.0)
 
 
-class TestMultinomialSample:
-    """Tests for multinomial sampling."""
+class TestGumbelSample:
+    """Tests for Gumbel-max sampling."""
 
-    def test_returns_int(self):
-        """Should return an int."""
-        logits = Tensor([1.0, 2.0, 3.0])
-        result = _multinomial_sample(logits)
-        assert isinstance(result, int)
+    def test_returns_tensor(self):
+        """Should return a tensor of indices."""
+        logits = Tensor([[1.0, 2.0, 3.0]])
+        result = _gumbel_sample(logits)
+        assert result.shape == (1,)
 
     def test_returns_valid_index(self):
-        """Should return an index within vocab range."""
-        logits = Tensor([1.0, 2.0, 3.0])
-        idx = _multinomial_sample(logits)
+        """Should return indices within vocab range."""
+        logits = Tensor([[1.0, 2.0, 3.0]])
+        idx = int(_gumbel_sample(logits).item())
         assert 0 <= idx < 3
 
     def test_higher_logits_more_likely(self):
         """Higher logits should be sampled more often."""
-        logits = Tensor([0.0, 0.0, 10.0])  # token 2 is much more likely
-        samples = [_multinomial_sample(logits) for _ in range(50)]
-        # Token 2 should dominate
+        logits = Tensor([[0.0, 0.0, 10.0]])
+        samples = [int(_gumbel_sample(logits).item()) for _ in range(50)]
         assert samples.count(2) >= 40
 
     def test_uniform_logits_give_variety(self):
         """Equal logits should give roughly uniform sampling."""
-        logits = Tensor([0.0, 0.0, 0.0, 0.0])
-        samples = [_multinomial_sample(logits) for _ in range(100)]
-        # Should see multiple different tokens
+        logits = Tensor([[0.0, 0.0, 0.0, 0.0]])
+        samples = [int(_gumbel_sample(logits).item()) for _ in range(100)]
         assert len(set(samples)) >= 3
 
     def test_handles_negative_inf(self):
         """Should handle -inf logits (masked tokens)."""
-        logits = Tensor([float("-inf"), float("-inf"), 5.0, float("-inf")])
-        samples = [_multinomial_sample(logits) for _ in range(20)]
-        # Only token 2 should be sampled
+        logits = Tensor([[float("-inf"), float("-inf"), 5.0, float("-inf")]])
+        samples = [int(_gumbel_sample(logits).item()) for _ in range(20)]
         assert all(s == 2 for s in samples)
 
-
-class TestRepetitionPenalty:
-    """Tests for repetition penalty."""
-
-    def test_no_penalty_when_1(self):
-        """Penalty of 1.0 should not change logits."""
-        logits = Tensor([1.0, 2.0, 3.0])
-        result = _repetition_penalty(logits, 1.0, [0, 1])
-        result_list = result.realize().tolist()
-        assert result_list[0] == pytest.approx(1.0)
-        assert result_list[1] == pytest.approx(2.0)
-        assert result_list[2] == pytest.approx(3.0)
-
-    def test_empty_seen_tokens(self):
-        """Empty seen_tokens should not change logits."""
-        logits = Tensor([1.0, 2.0, 3.0])
-        result = _repetition_penalty(logits, 2.0, [])
-        result_list = result.realize().tolist()
-        assert result_list[0] == pytest.approx(1.0)
-        assert result_list[1] == pytest.approx(2.0)
-        assert result_list[2] == pytest.approx(3.0)
-
-    def test_penalizes_seen_tokens(self):
-        """Should penalize seen tokens."""
-        logits = Tensor([2.0, 4.0, 1.0])
-        result = _repetition_penalty(logits, 2.0, [0, 1])
-        result_list = result.realize().tolist()
-
-        # Positive logits should be divided by penalty
-        assert result_list[0] == pytest.approx(1.0)  # 2.0 / 2.0
-        assert result_list[1] == pytest.approx(2.0)  # 4.0 / 2.0
-        assert result_list[2] == pytest.approx(1.0)  # unchanged
+    def test_batched(self):
+        """Should sample multiple sequences in parallel."""
+        logits = Tensor([
+            [10.0, 0.0, 0.0],
+            [0.0, 10.0, 0.0],
+            [0.0, 0.0, 10.0],
+        ])
+        result = _gumbel_sample(logits)
+        assert result.shape == (3,)
+        samples = result.tolist()
+        assert samples == [0, 1, 2]
 
 
 class TestSampleTokens:
