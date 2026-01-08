@@ -198,32 +198,13 @@ class Attention:
         """Write K/V to block-based cache. Groups tokens by block for batched writes."""
         seq_len = k.shape[0]
         block_size = block_manager.block_size
-        block_table = block_manager.get_block_table(seq_id)
-
-        token_idx = 0
-        pos = start_pos
+        token_idx, pos = 0, start_pos
 
         while token_idx < seq_len:
-            block_idx = pos // block_size
             offset = pos % block_size
             tokens_in_block = min(block_size - offset, seq_len - token_idx)
-
-            # Allocate new block if needed (only in first layer)
-            if block_idx >= len(block_table) and layer_idx == 0:
-                gpu_id = block_manager.get_gpu_for_seq(seq_id)
-                if len(block_manager.free_blocks[gpu_id]) == 0:
-                    raise RuntimeError("Out of KV cache memory!")
-                new_block = block_manager.free_blocks[gpu_id].pop()
-                block_manager.ref_counts[gpu_id][new_block] = 1
-                block_manager.block_tables[seq_id].append(new_block)
-                block_table = block_manager.get_block_table(seq_id)
-
-            block_id = block_table[block_idx]
-
-            k_batch = k[token_idx:token_idx + tokens_in_block]
-            v_batch = v[token_idx:token_idx + tokens_in_block]
-            kv_cache.write_kv(layer_idx, block_id, offset, k_batch, v_batch)
-
+            block_id = block_manager.ensure_block_for_position(seq_id, pos) if layer_idx == 0 else block_manager.get_block_table(seq_id)[pos // block_size]
+            kv_cache.write_kv(layer_idx, block_id, offset, k[token_idx:token_idx + tokens_in_block], v[token_idx:token_idx + tokens_in_block])
             token_idx += tokens_in_block
             pos += tokens_in_block
 
@@ -398,28 +379,10 @@ class Llama:
         )
 
         # Write K/V to cache (outside JIT)
-        for i, (seq_id, start_pos) in enumerate(zip(seq_ids, start_positions)):
-            block_idx = start_pos // block_manager.block_size
-            offset = start_pos % block_manager.block_size
-            block_table = block_manager.get_block_table(seq_id)
-
-            if block_idx >= len(block_table):
-                gpu_id = block_manager.get_gpu_for_seq(seq_id)
-                if len(block_manager.free_blocks[gpu_id]) == 0:
-                    raise RuntimeError("Out of KV cache memory!")
-                new_block = block_manager.free_blocks[gpu_id].pop()
-                block_manager.ref_counts[gpu_id][new_block] = 1
-                block_manager.block_tables[seq_id].append(new_block)
-                block_table = block_manager.get_block_table(seq_id)
-
-            block_id = block_table[block_idx]
-
+        for i, seq_id in enumerate(seq_ids):
+            _, block_id, offset = block_manager.get_slot(seq_id)
             for layer_idx in range(self.config.n_layers):
-                k = k_all[layer_idx, i:i+1]
-                v = v_all[layer_idx, i:i+1]
-                kv_cache.write_kv(layer_idx, block_id, offset, k, v)
-
-        for seq_id in seq_ids:
+                kv_cache.write_kv(layer_idx, block_id, offset, k_all[layer_idx, i:i+1], v_all[layer_idx, i:i+1])
             block_manager.advance_position(seq_id)
 
         return logits

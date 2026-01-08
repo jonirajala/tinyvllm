@@ -13,6 +13,15 @@ from tinyvllm.core.kv_cache import KVCache
 from tinyvllm.core.block_manager import BlockManager
 
 
+def _setup_seq(bm, seq_id, num_tokens):
+    """Helper to register sequence and pre-allocate blocks."""
+    bm.register_sequence(seq_id=seq_id)
+    if num_tokens > 0:
+        bm.ensure_block_for_position(seq_id=seq_id, pos=num_tokens-1)
+
+
+
+
 def create_test_model():
     """Create a small test model."""
     config = LlamaConfig(
@@ -85,7 +94,7 @@ class TestJitDecodeCorrectness:
 
         # Allocate and prefill to populate cache
         prompt_tokens = [1, 2, 3, 4, 5]
-        block_manager.allocate_sequence(seq_id=0, num_tokens=len(prompt_tokens) + 10)
+        _setup_seq(block_manager, seq_id=0, num_tokens=len(prompt_tokens) + 10)
         tokens = Tensor([prompt_tokens], dtype=dtypes.int32).realize()
         _ = model.prefill(tokens, kv_cache=kv_cache, block_manager=block_manager, seq_id=0)
 
@@ -122,7 +131,7 @@ class TestJitDecodeCorrectness:
 
         # Allocate and prefill
         prompt_tokens = [1, 2, 3, 4, 5]
-        block_manager.allocate_sequence(seq_id=0, num_tokens=len(prompt_tokens) + 10)
+        _setup_seq(block_manager, seq_id=0, num_tokens=len(prompt_tokens) + 10)
         tokens = Tensor([prompt_tokens], dtype=dtypes.int32).realize()
         _ = model.prefill(tokens, kv_cache=kv_cache, block_manager=block_manager, seq_id=0)
 
@@ -175,7 +184,7 @@ class TestJitDecodeConsistency:
 
         # Allocate and prefill
         prompt_tokens = [1, 2, 3, 4, 5]
-        block_manager.allocate_sequence(seq_id=0, num_tokens=len(prompt_tokens) + 10)
+        _setup_seq(block_manager, seq_id=0, num_tokens=len(prompt_tokens) + 10)
         tokens = Tensor([prompt_tokens], dtype=dtypes.int32).realize()
         _ = model.prefill(tokens, kv_cache=kv_cache, block_manager=block_manager, seq_id=0)
 
@@ -220,7 +229,7 @@ class TestJitDecodeEdgeCases:
         block_manager, kv_cache = create_test_components(config, block_size=block_size)
 
         # Single token prefill
-        block_manager.allocate_sequence(seq_id=0, num_tokens=5)
+        _setup_seq(block_manager, seq_id=0, num_tokens=5)
         tokens = Tensor([[1]], dtype=dtypes.int32).realize()
         _ = model.prefill(tokens, kv_cache=kv_cache, block_manager=block_manager, seq_id=0)
 
@@ -257,7 +266,7 @@ class TestJitDecodeEdgeCases:
 
         # Longer prefill spanning multiple blocks
         prompt_tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-        block_manager.allocate_sequence(seq_id=0, num_tokens=len(prompt_tokens) + 5)
+        _setup_seq(block_manager, seq_id=0, num_tokens=len(prompt_tokens) + 5)
         tokens = Tensor([prompt_tokens], dtype=dtypes.int32).realize()
         _ = model.prefill(tokens, kv_cache=kv_cache, block_manager=block_manager, seq_id=0)
 

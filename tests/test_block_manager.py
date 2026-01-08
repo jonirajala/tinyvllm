@@ -4,6 +4,13 @@ import pytest
 from tinyvllm.core.block_manager import BlockManager
 
 
+def setup_sequence(bm: BlockManager, seq_id: int, num_tokens: int, gpu_id: int = 0) -> None:
+    """Helper to register sequence and pre-allocate blocks for num_tokens."""
+    bm.register_sequence(seq_id, gpu_id)
+    if num_tokens > 0:
+        bm.ensure_block_for_position(seq_id, num_tokens - 1)
+
+
 class TestBlockManagerInit:
     def test_init_single_gpu(self):
         bm = BlockManager(num_gpus=1, blocks_per_gpu=100, block_size=16)
@@ -24,62 +31,73 @@ class TestBlockManagerInit:
             assert bm.ref_counts[0][block_id] == 0
 
 
-class TestAllocateSequence:
-    def test_allocate_single_block(self):
+class TestRegisterSequence:
+    def test_register_creates_empty_entry(self):
         bm = BlockManager(num_gpus=1, blocks_per_gpu=10, block_size=16)
-        gpu_id = bm.allocate_sequence(seq_id=0, num_tokens=10)
+        bm.register_sequence(seq_id=0)
 
-        assert gpu_id == 0
-        assert len(bm.block_tables[0]) == 1  # 10 tokens, block_size=16 → 1 block
+        assert 0 in bm.seq_to_gpu
+        assert bm.block_tables[0] == []
         assert bm.seq_positions[0] == 0
-        assert len(bm.free_blocks[0]) == 9  # 1 block used
+        assert len(bm.free_blocks[0]) == 10
 
-    def test_allocate_multiple_blocks(self):
+    def test_register_with_gpu_id(self):
+        bm = BlockManager(num_gpus=2, blocks_per_gpu=10, block_size=16)
+        bm.register_sequence(seq_id=0, gpu_id=1)
+
+        assert bm.seq_to_gpu[0] == 1
+
+
+class TestEnsureBlockForPosition:
+    def test_allocates_single_block(self):
         bm = BlockManager(num_gpus=1, blocks_per_gpu=10, block_size=16)
-        bm.allocate_sequence(seq_id=0, num_tokens=50)
+        bm.register_sequence(seq_id=0)
 
-        assert len(bm.block_tables[0]) == 4  # ceil(50/16) = 4 blocks
+        block_id = bm.ensure_block_for_position(seq_id=0, pos=10)
+
+        assert len(bm.block_tables[0]) == 1
+        assert len(bm.free_blocks[0]) == 9
+
+    def test_allocates_multiple_blocks(self):
+        bm = BlockManager(num_gpus=1, blocks_per_gpu=10, block_size=16)
+        bm.register_sequence(seq_id=0)
+
+        bm.ensure_block_for_position(seq_id=0, pos=49)  # ceil(50/16) = 4 blocks
+
+        assert len(bm.block_tables[0]) == 4
         assert len(bm.free_blocks[0]) == 6
 
-    def test_allocate_sets_ref_count(self):
+    def test_sets_ref_count(self):
         bm = BlockManager(num_gpus=1, blocks_per_gpu=10, block_size=16)
-        bm.allocate_sequence(seq_id=0, num_tokens=20)
+        bm.register_sequence(seq_id=0)
+        bm.ensure_block_for_position(seq_id=0, pos=19)
 
         for block_id in bm.block_tables[0]:
             assert bm.ref_counts[0][block_id] == 1
 
-    def test_allocate_load_balancing(self):
-        bm = BlockManager(num_gpus=2, blocks_per_gpu=10, block_size=16)
-
-        # Use up some blocks on GPU 0
-        bm.free_blocks[0] = bm.free_blocks[0][:3]  # Only 3 free on GPU 0
-
-        # Should allocate on GPU 1 (has more free blocks)
-        gpu_id = bm.allocate_sequence(seq_id=0, num_tokens=10)
-        assert gpu_id == 1
-
-    def test_allocate_out_of_memory(self):
+    def test_out_of_memory(self):
         bm = BlockManager(num_gpus=1, blocks_per_gpu=2, block_size=16)
+        bm.register_sequence(seq_id=0)
 
-        with pytest.raises(RuntimeError, match="Not enough free blocks"):
-            bm.allocate_sequence(seq_id=0, num_tokens=100)  # Needs 7 blocks, only 2 available
+        with pytest.raises(RuntimeError, match="Out of KV cache memory"):
+            bm.ensure_block_for_position(seq_id=0, pos=99)  # Needs 7 blocks
 
 
 class TestGetSlot:
     def test_get_slot_basic(self):
         bm = BlockManager(num_gpus=1, blocks_per_gpu=10, block_size=16)
-        bm.allocate_sequence(seq_id=0, num_tokens=10)
+        setup_sequence(bm, seq_id=0, num_tokens=10)
 
         gpu_id, block_id, offset = bm.get_slot(seq_id=0)
 
         assert gpu_id == 0
         assert block_id == bm.block_tables[0][0]
-        assert offset == 0  # Position 0 → offset 0
+        assert offset == 0
 
     def test_get_slot_with_offset(self):
         bm = BlockManager(num_gpus=1, blocks_per_gpu=10, block_size=16)
-        bm.allocate_sequence(seq_id=0, num_tokens=10)
-        bm.seq_positions[0] = 5  # Simulate 5 tokens written
+        setup_sequence(bm, seq_id=0, num_tokens=10)
+        bm.seq_positions[0] = 5
 
         gpu_id, block_id, offset = bm.get_slot(seq_id=0)
 
@@ -87,19 +105,19 @@ class TestGetSlot:
 
     def test_get_slot_crosses_block_boundary(self):
         bm = BlockManager(num_gpus=1, blocks_per_gpu=10, block_size=16)
-        bm.allocate_sequence(seq_id=0, num_tokens=10)  # 1 block allocated
-        bm.seq_positions[0] = 16  # Position 16 → need second block
+        setup_sequence(bm, seq_id=0, num_tokens=10)
+        bm.seq_positions[0] = 16
 
         initial_blocks = len(bm.block_tables[0])
         gpu_id, block_id, offset = bm.get_slot(seq_id=0)
 
-        assert len(bm.block_tables[0]) == initial_blocks + 1  # New block allocated
-        assert offset == 0  # First position in new block
+        assert len(bm.block_tables[0]) == initial_blocks + 1
+        assert offset == 0
 
     def test_get_slot_new_block_ref_count(self):
         bm = BlockManager(num_gpus=1, blocks_per_gpu=10, block_size=16)
-        bm.allocate_sequence(seq_id=0, num_tokens=10)
-        bm.seq_positions[0] = 16  # Force new block allocation
+        setup_sequence(bm, seq_id=0, num_tokens=10)
+        bm.seq_positions[0] = 16
 
         bm.get_slot(seq_id=0)
         new_block = bm.block_tables[0][-1]
@@ -108,8 +126,8 @@ class TestGetSlot:
 
     def test_get_slot_out_of_memory(self):
         bm = BlockManager(num_gpus=1, blocks_per_gpu=1, block_size=16)
-        bm.allocate_sequence(seq_id=0, num_tokens=10)  # Uses the only block
-        bm.seq_positions[0] = 16  # Need new block but none available
+        setup_sequence(bm, seq_id=0, num_tokens=10)
+        bm.seq_positions[0] = 16
 
         with pytest.raises(RuntimeError, match="Out of KV cache memory"):
             bm.get_slot(seq_id=0)
@@ -118,7 +136,7 @@ class TestGetSlot:
 class TestAdvancePosition:
     def test_advance_position(self):
         bm = BlockManager(num_gpus=1, blocks_per_gpu=10, block_size=16)
-        bm.allocate_sequence(seq_id=0, num_tokens=10)
+        setup_sequence(bm, seq_id=0, num_tokens=10)
 
         assert bm.seq_positions[0] == 0
         bm.advance_position(seq_id=0)
@@ -130,7 +148,7 @@ class TestAdvancePosition:
 class TestGetBlockTable:
     def test_get_block_table(self):
         bm = BlockManager(num_gpus=1, blocks_per_gpu=10, block_size=16)
-        bm.allocate_sequence(seq_id=0, num_tokens=50)
+        setup_sequence(bm, seq_id=0, num_tokens=50)
 
         block_table = bm.get_block_table(seq_id=0)
 
@@ -141,7 +159,7 @@ class TestGetBlockTable:
 class TestGetContextLength:
     def test_get_context_length(self):
         bm = BlockManager(num_gpus=1, blocks_per_gpu=10, block_size=16)
-        bm.allocate_sequence(seq_id=0, num_tokens=10)
+        setup_sequence(bm, seq_id=0, num_tokens=10)
 
         assert bm.get_context_length(seq_id=0) == 0
 
@@ -155,10 +173,7 @@ class TestGetContextLength:
 class TestGetGpuForSeq:
     def test_get_gpu_for_seq(self):
         bm = BlockManager(num_gpus=2, blocks_per_gpu=10, block_size=16)
-
-        # Force allocation on GPU 1
-        bm.free_blocks[0] = []
-        bm.allocate_sequence(seq_id=0, num_tokens=10)
+        setup_sequence(bm, seq_id=0, num_tokens=10, gpu_id=1)
 
         assert bm.get_gpu_for_seq(seq_id=0) == 1
 
@@ -166,17 +181,17 @@ class TestGetGpuForSeq:
 class TestFreeSequence:
     def test_free_sequence_returns_blocks(self):
         bm = BlockManager(num_gpus=1, blocks_per_gpu=10, block_size=16)
-        bm.allocate_sequence(seq_id=0, num_tokens=32)  # 2 blocks
+        setup_sequence(bm, seq_id=0, num_tokens=32)
 
         assert len(bm.free_blocks[0]) == 8
 
         bm.free_sequence(seq_id=0)
 
-        assert len(bm.free_blocks[0]) == 10  # All blocks returned
+        assert len(bm.free_blocks[0]) == 10
 
     def test_free_sequence_cleans_up(self):
         bm = BlockManager(num_gpus=1, blocks_per_gpu=10, block_size=16)
-        bm.allocate_sequence(seq_id=0, num_tokens=10)
+        setup_sequence(bm, seq_id=0, num_tokens=10)
 
         bm.free_sequence(seq_id=0)
 
@@ -186,15 +201,13 @@ class TestFreeSequence:
 
     def test_free_sequence_with_shared_blocks(self):
         bm = BlockManager(num_gpus=1, blocks_per_gpu=10, block_size=16)
-        bm.allocate_sequence(seq_id=0, num_tokens=10)
+        setup_sequence(bm, seq_id=0, num_tokens=10)
         bm.fork_sequence(src_seq_id=0, dst_seq_id=1)
 
-        # Both sequences share same blocks, ref_count=2
         shared_blocks = bm.block_tables[0].copy()
 
         bm.free_sequence(seq_id=0)
 
-        # Blocks should NOT be returned to free list (still used by seq 1)
         for block_id in shared_blocks:
             assert block_id not in bm.free_blocks[0]
             assert bm.ref_counts[0][block_id] == 1
@@ -203,50 +216,31 @@ class TestFreeSequence:
 class TestGetNumFreeBlocks:
     def test_get_num_free_blocks_specific_gpu(self):
         bm = BlockManager(num_gpus=2, blocks_per_gpu=10, block_size=16)
-        bm.free_blocks[0] = bm.free_blocks[0][:7]  # 7 free on GPU 0
+        bm.free_blocks[0] = bm.free_blocks[0][:7]
 
         assert bm.get_num_free_blocks(gpu_id=0) == 7
         assert bm.get_num_free_blocks(gpu_id=1) == 10
 
     def test_get_num_free_blocks_all_gpus(self):
         bm = BlockManager(num_gpus=2, blocks_per_gpu=10, block_size=16)
-        bm.free_blocks[0] = bm.free_blocks[0][:7]  # 7 free on GPU 0
+        bm.free_blocks[0] = bm.free_blocks[0][:7]
 
-        assert bm.get_num_free_blocks() == 17  # 7 + 10
-
-
-class TestCanAllocate:
-    def test_can_allocate_enough_space(self):
-        bm = BlockManager(num_gpus=1, blocks_per_gpu=10, block_size=16)
-
-        assert bm.can_allocate(num_tokens=100) is True  # Needs 7 blocks, have 10
-
-    def test_can_allocate_not_enough_space(self):
-        bm = BlockManager(num_gpus=1, blocks_per_gpu=2, block_size=16)
-
-        assert bm.can_allocate(num_tokens=100) is False  # Needs 7 blocks, have 2
-
-    def test_can_allocate_multi_gpu(self):
-        bm = BlockManager(num_gpus=2, blocks_per_gpu=5, block_size=16)
-        bm.free_blocks[0] = []  # GPU 0 full
-
-        # GPU 1 has 5 blocks, enough for 50 tokens
-        assert bm.can_allocate(num_tokens=50) is True
+        assert bm.get_num_free_blocks() == 17
 
 
 class TestForkSequence:
     def test_fork_copies_block_table(self):
         bm = BlockManager(num_gpus=1, blocks_per_gpu=10, block_size=16)
-        bm.allocate_sequence(seq_id=0, num_tokens=32)
+        setup_sequence(bm, seq_id=0, num_tokens=32)
 
         bm.fork_sequence(src_seq_id=0, dst_seq_id=1)
 
         assert bm.block_tables[1] == bm.block_tables[0]
-        assert bm.block_tables[1] is not bm.block_tables[0]  # Different list object
+        assert bm.block_tables[1] is not bm.block_tables[0]
 
     def test_fork_copies_position(self):
         bm = BlockManager(num_gpus=1, blocks_per_gpu=10, block_size=16)
-        bm.allocate_sequence(seq_id=0, num_tokens=10)
+        setup_sequence(bm, seq_id=0, num_tokens=10)
         bm.seq_positions[0] = 5
 
         bm.fork_sequence(src_seq_id=0, dst_seq_id=1)
@@ -255,7 +249,7 @@ class TestForkSequence:
 
     def test_fork_increments_ref_counts(self):
         bm = BlockManager(num_gpus=1, blocks_per_gpu=10, block_size=16)
-        bm.allocate_sequence(seq_id=0, num_tokens=32)
+        setup_sequence(bm, seq_id=0, num_tokens=32)
 
         bm.fork_sequence(src_seq_id=0, dst_seq_id=1)
 
@@ -264,8 +258,7 @@ class TestForkSequence:
 
     def test_fork_same_gpu(self):
         bm = BlockManager(num_gpus=2, blocks_per_gpu=10, block_size=16)
-        bm.free_blocks[0] = []  # Force allocation on GPU 1
-        bm.allocate_sequence(seq_id=0, num_tokens=10)
+        setup_sequence(bm, seq_id=0, num_tokens=10, gpu_id=1)
 
         bm.fork_sequence(src_seq_id=0, dst_seq_id=1)
 
@@ -274,35 +267,30 @@ class TestForkSequence:
 
 class TestIntegration:
     def test_full_sequence_lifecycle(self):
-        """Test: allocate → write tokens → free"""
+        """Test: register → write tokens → free"""
         bm = BlockManager(num_gpus=1, blocks_per_gpu=10, block_size=16)
 
-        # Allocate
-        bm.allocate_sequence(seq_id=0, num_tokens=10)
-        assert bm.get_num_free_blocks() == 9
+        bm.register_sequence(seq_id=0)
 
         # Simulate writing 20 tokens (crosses block boundary)
         for i in range(20):
             gpu_id, block_id, offset = bm.get_slot(seq_id=0)
-            # Would write K/V here
             bm.advance_position(seq_id=0)
 
         assert bm.get_context_length(seq_id=0) == 20
-        assert len(bm.get_block_table(seq_id=0)) == 2  # 20 tokens → 2 blocks
+        assert len(bm.get_block_table(seq_id=0)) == 2
 
-        # Free
         bm.free_sequence(seq_id=0)
-        assert bm.get_num_free_blocks() == 10  # All blocks returned
+        assert bm.get_num_free_blocks() == 10
 
     def test_multiple_sequences(self):
         """Test multiple concurrent sequences"""
         bm = BlockManager(num_gpus=1, blocks_per_gpu=20, block_size=16)
 
-        bm.allocate_sequence(seq_id=0, num_tokens=20)
-        bm.allocate_sequence(seq_id=1, num_tokens=30)
-        bm.allocate_sequence(seq_id=2, num_tokens=10)
+        setup_sequence(bm, seq_id=0, num_tokens=20)
+        setup_sequence(bm, seq_id=1, num_tokens=30)
+        setup_sequence(bm, seq_id=2, num_tokens=10)
 
-        # 2 + 2 + 1 = 5 blocks used
         assert bm.get_num_free_blocks() == 15
 
         bm.free_sequence(seq_id=1)
@@ -312,27 +300,21 @@ class TestIntegration:
         """Test fork and diverge scenario"""
         bm = BlockManager(num_gpus=1, blocks_per_gpu=20, block_size=16)
 
-        # Initial sequence
-        bm.allocate_sequence(seq_id=0, num_tokens=10)
+        bm.register_sequence(seq_id=0)
         for _ in range(10):
             bm.get_slot(seq_id=0)
             bm.advance_position(seq_id=0)
 
-        # Fork for beam search
         bm.fork_sequence(src_seq_id=0, dst_seq_id=1)
         bm.fork_sequence(src_seq_id=0, dst_seq_id=2)
 
-        # All share same blocks
         assert bm.block_tables[0] == bm.block_tables[1] == bm.block_tables[2]
 
-        # Diverge: each generates different tokens
         for seq_id in [0, 1, 2]:
             bm.get_slot(seq_id=seq_id)
             bm.advance_position(seq_id=seq_id)
 
-        # Free one beam
         bm.free_sequence(seq_id=2)
 
-        # Original blocks still in use by seq 0 and 1
         assert 0 in bm.block_tables
         assert 1 in bm.block_tables

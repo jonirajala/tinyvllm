@@ -40,11 +40,7 @@ class Scheduler:
 
         while len(batch.scheduled_seqs) < self.max_batch_size and self.waiting:
             request = self.waiting[0]
-            num_tokens = len(request.prompt_tokens)
-
-            if not self.block_manager.can_allocate(num_tokens):
-                break
-            self.block_manager.allocate_sequence(self.next_seq_id, num_tokens)
+            self.block_manager.register_sequence(self.next_seq_id)
 
             self.waiting.pop(0)
             sequence = self._seq_pool.acquire()

@@ -15,6 +15,15 @@ from tinyvllm.core.sampling import SamplingParams
 from tinyvllm.core.engine import LLMEngine
 
 
+def _setup_seq(bm, seq_id, num_tokens):
+    """Helper to register sequence and pre-allocate blocks."""
+    bm.register_sequence(seq_id=seq_id)
+    if num_tokens > 0:
+        bm.ensure_block_for_position(seq_id=seq_id, pos=num_tokens-1)
+
+
+
+
 def create_test_model():
     """Create a small test model."""
     config = LlamaConfig(
@@ -55,29 +64,29 @@ class TestBlockManagerOOM:
         bm = BlockManager(num_gpus=1, blocks_per_gpu=2, block_size=16)
 
         # Request 100 tokens = 7 blocks, but only 2 available
-        with pytest.raises(RuntimeError, match="Not enough free blocks"):
-            bm.allocate_sequence(seq_id=0, num_tokens=100)
+        with pytest.raises(RuntimeError, match="Out of KV cache memory"):
+            _setup_seq(bm, seq_id=0, num_tokens=100)
 
     def test_multiple_allocations_exhaust_memory(self):
         """Should raise RuntimeError when cumulative allocations exceed capacity."""
         bm = BlockManager(num_gpus=1, blocks_per_gpu=4, block_size=16)
 
         # First allocation: 32 tokens = 2 blocks
-        bm.allocate_sequence(seq_id=0, num_tokens=32)
+        _setup_seq(bm, seq_id=0, num_tokens=32)
 
         # Second allocation: 32 tokens = 2 blocks (uses remaining)
-        bm.allocate_sequence(seq_id=1, num_tokens=32)
+        _setup_seq(bm, seq_id=1, num_tokens=32)
 
         # Third allocation: should fail
-        with pytest.raises(RuntimeError, match="Not enough free blocks"):
-            bm.allocate_sequence(seq_id=2, num_tokens=32)
+        with pytest.raises(RuntimeError, match="Out of KV cache memory"):
+            _setup_seq(bm, seq_id=2, num_tokens=32)
 
     def test_get_slot_oom_when_extending(self):
         """Should raise RuntimeError when extending sequence with no free blocks."""
         bm = BlockManager(num_gpus=1, blocks_per_gpu=1, block_size=16)
 
         # Allocate sequence using the only block
-        bm.allocate_sequence(seq_id=0, num_tokens=10)
+        _setup_seq(bm, seq_id=0, num_tokens=10)
 
         # Advance to position 16 (needs second block)
         bm.seq_positions[0] = 16
@@ -89,34 +98,21 @@ class TestBlockManagerOOM:
 class TestBlockManagerBasic:
     """Tests for basic BlockManager operations."""
 
-    def test_can_allocate_returns_false_when_full(self):
-        """can_allocate should return False when not enough space."""
-        bm = BlockManager(num_gpus=1, blocks_per_gpu=2, block_size=16)
-
-        assert bm.can_allocate(num_tokens=100) is False  # Needs 7 blocks
-
-    def test_can_allocate_returns_true_when_sufficient(self):
-        """can_allocate should return True when enough space."""
-        bm = BlockManager(num_gpus=1, blocks_per_gpu=10, block_size=16)
-
-        assert bm.can_allocate(num_tokens=100) is True  # Needs 7 blocks, have 10
-
     def test_free_sequence_allows_reallocation(self):
         """After freeing, blocks should be available again."""
         bm = BlockManager(num_gpus=1, blocks_per_gpu=4, block_size=16)
 
         # Allocate all 4 blocks
-        bm.allocate_sequence(seq_id=0, num_tokens=64)
-
-        # Can't allocate more
-        assert bm.can_allocate(num_tokens=16) is False
+        _setup_seq(bm, seq_id=0, num_tokens=64)
+        assert bm.get_num_free_blocks() == 0
 
         # Free the sequence
         bm.free_sequence(seq_id=0)
+        assert bm.get_num_free_blocks() == 4
 
         # Now can allocate again
-        assert bm.can_allocate(num_tokens=16) is True
-        bm.allocate_sequence(seq_id=1, num_tokens=16)
+        _setup_seq(bm, seq_id=1, num_tokens=16)
+        assert bm.get_num_free_blocks() == 3
 
 
 class TestEngineErrorHandling:
@@ -218,7 +214,7 @@ class TestModelEdgeCases:
             dtype=dtypes.float32,
         )
 
-        block_manager.allocate_sequence(seq_id=0, num_tokens=1)
+        _setup_seq(block_manager, seq_id=0, num_tokens=1)
         tokens = Tensor([[42]], dtype=dtypes.int32)
 
         logits = model.prefill(tokens, kv_cache=kv_cache, block_manager=block_manager, seq_id=0)
@@ -240,7 +236,7 @@ class TestModelEdgeCases:
         )
 
         seq_len = 64  # Below max_seq_len of 128
-        block_manager.allocate_sequence(seq_id=0, num_tokens=seq_len)
+        _setup_seq(block_manager, seq_id=0, num_tokens=seq_len)
         tokens = Tensor([[i % config.vocab_size for i in range(seq_len)]], dtype=dtypes.int32)
 
         logits = model.prefill(tokens, kv_cache=kv_cache, block_manager=block_manager, seq_id=0)

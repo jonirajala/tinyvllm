@@ -37,7 +37,7 @@ class KVCache:
         self.k_cache[layer_idx][block_id, start_offset:end_offset] = k
         self.v_cache[layer_idx][block_id, start_offset:end_offset] = v
 
-    def read_kv_blocks(self, layer_idx: int, block_ids: List[int], context_len: int) -> Tuple[Tensor, Tensor]:
+    def write_kv(self, layer_idx: int, block_ids: List[int], context_len: int) -> Tuple[Tensor, Tensor]:
         """Read K/V from blocks. Returns tensors of shape [context_len, n_kv_heads, head_dim]."""
         if not block_ids:
             return (

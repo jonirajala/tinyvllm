@@ -9,6 +9,15 @@ from tinyvllm.core.sampling import SamplingParams
 from tinyvllm.core.engine import LLMEngine, generate_batch
 
 
+def _setup_seq(bm, seq_id, num_tokens):
+    """Helper to register sequence and pre-allocate blocks."""
+    bm.register_sequence(seq_id=seq_id)
+    if num_tokens > 0:
+        bm.ensure_block_for_position(seq_id=seq_id, pos=num_tokens-1)
+
+
+
+
 # Small config for fast tests
 def small_config():
     return LlamaConfig(
@@ -170,7 +179,7 @@ class TestModelWeightLoading:
         )
 
         tokens = Tensor([[1, 2, 3, 4]])
-        block_manager.allocate_sequence(seq_id=0, num_tokens=4)
+        _setup_seq(block_manager, seq_id=0, num_tokens=4)
         logits = model.prefill(tokens, start_pos=0, kv_cache=kv_cache,
                                block_manager=block_manager, seq_id=0)
 
@@ -227,7 +236,7 @@ class TestModelWeightLoading:
         )
 
         tokens = Tensor([[1, 2, 3]])
-        block_manager.allocate_sequence(seq_id=0, num_tokens=3)
+        _setup_seq(block_manager, seq_id=0, num_tokens=3)
         logits = model.prefill(tokens, kv_cache=kv_cache, block_manager=block_manager, seq_id=0)
 
         assert logits.shape == (1, 3, config.vocab_size)

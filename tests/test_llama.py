@@ -18,6 +18,13 @@ from tinyvllm.core.kv_cache import KVCache
 from tinyvllm.core.block_manager import BlockManager
 
 
+def _setup_seq(bm, seq_id, num_tokens):
+    """Helper to register sequence and pre-allocate blocks."""
+    bm.register_sequence(seq_id=seq_id)
+    if num_tokens > 0:
+        bm.ensure_block_for_position(seq_id=seq_id, pos=num_tokens-1)
+
+
 # Small config for fast tests
 def small_config():
     return LlamaConfig(
@@ -190,7 +197,7 @@ class TestAttention:
         cos, sin = precompute_freqs_cis(config.head_dim, seq)
 
         # Allocate sequence in BlockManager
-        block_manager.allocate_sequence(seq_id=0, num_tokens=seq)
+        _setup_seq(block_manager, seq_id=0, num_tokens=seq)
         out = attn(x, cos, sin, kv_cache, block_manager, layer_idx=0,
                    seq_ids=[0], start_positions=[0])
 
@@ -206,7 +213,7 @@ class TestAttention:
         x = Tensor.randn(batch, seq, config.dim)
         cos, sin = precompute_freqs_cis(config.head_dim, seq)
 
-        block_manager.allocate_sequence(seq_id=0, num_tokens=seq)
+        _setup_seq(block_manager, seq_id=0, num_tokens=seq)
         out = attn(x, cos, sin, kv_cache, block_manager, layer_idx=0,
                    seq_ids=[0], start_positions=[0])
 
@@ -250,7 +257,7 @@ class TestTransformerBlock:
         x = Tensor.randn(batch, seq, config.dim)
         cos, sin = precompute_freqs_cis(config.head_dim, seq)
 
-        block_manager.allocate_sequence(seq_id=0, num_tokens=seq)
+        _setup_seq(block_manager, seq_id=0, num_tokens=seq)
         out = block(x, cos, sin, kv_cache, block_manager, layer_idx=0,
                     seq_ids=[0], start_positions=[0])
         assert out.shape == x.shape
@@ -265,7 +272,7 @@ class TestTransformerBlock:
         x = Tensor.randn(batch, seq, config.dim)
         cos, sin = precompute_freqs_cis(config.head_dim, seq)
 
-        block_manager.allocate_sequence(seq_id=0, num_tokens=seq)
+        _setup_seq(block_manager, seq_id=0, num_tokens=seq)
         out = block(x, cos, sin, kv_cache, block_manager, layer_idx=0,
                     seq_ids=[0], start_positions=[0])
 
@@ -287,7 +294,7 @@ class TestLlama:
         batch, seq = 1, 8
         tokens = Tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
 
-        block_manager.allocate_sequence(seq_id=0, num_tokens=seq)
+        _setup_seq(block_manager, seq_id=0, num_tokens=seq)
         logits = model.prefill(tokens, kv_cache=kv_cache, block_manager=block_manager, seq_id=0)
         assert logits.shape == (batch, seq, config.vocab_size)
 
@@ -300,7 +307,7 @@ class TestLlama:
         # Allocate enough blocks for prompt + generation
         prompt_len = 4
         max_gen = 3
-        block_manager.allocate_sequence(seq_id=0, num_tokens=prompt_len + max_gen)
+        _setup_seq(block_manager, seq_id=0, num_tokens=prompt_len + max_gen)
 
         # First pass: process prompt
         prompt = Tensor([[1, 2, 3, 4]])
@@ -325,7 +332,7 @@ class TestLlama:
         block_manager, kv_cache = create_test_components(config)
 
         tokens = Tensor([[42]])
-        block_manager.allocate_sequence(seq_id=0, num_tokens=1)
+        _setup_seq(block_manager, seq_id=0, num_tokens=1)
         logits = model.prefill(tokens, kv_cache=kv_cache, block_manager=block_manager, seq_id=0)
 
         assert logits.shape == (1, 1, config.vocab_size)
@@ -336,7 +343,7 @@ class TestLlama:
         model = Llama(config)
         block_manager, kv_cache = create_test_components(config)
 
-        block_manager.allocate_sequence(seq_id=0, num_tokens=5)
+        _setup_seq(block_manager, seq_id=0, num_tokens=5)
 
         # This is implicitly tested by the model working correctly
         tokens = Tensor([[1, 2, 3, 4, 5]])

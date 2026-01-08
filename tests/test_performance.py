@@ -19,6 +19,15 @@ from tinyvllm.core.sampling import SamplingParams
 from tinyvllm.core.engine import LLMEngine
 
 
+def _setup_seq(bm, seq_id, num_tokens):
+    """Helper to register sequence and pre-allocate blocks."""
+    bm.register_sequence(seq_id=seq_id)
+    if num_tokens > 0:
+        bm.ensure_block_for_position(seq_id=seq_id, pos=num_tokens-1)
+
+
+
+
 def create_test_model():
     """Create a small test model for performance tests."""
     config = LlamaConfig(
@@ -198,7 +207,7 @@ class TestPrefillPerformance:
                 dtype=dtypes.float32,
             )
 
-            bm.allocate_sequence(seq_id=0, num_tokens=seq_len)
+            _setup_seq(bm, seq_id=0, num_tokens=seq_len)
             tokens = Tensor([[i % config.vocab_size for i in range(seq_len)]], dtype=dtypes.int32)
 
             start = time.perf_counter()
@@ -233,7 +242,7 @@ class TestJitWarmup:
 
         # Prefill
         prompt_tokens = [1, 2, 3, 4, 5]
-        block_manager.allocate_sequence(seq_id=0, num_tokens=len(prompt_tokens) + 10)
+        _setup_seq(block_manager, seq_id=0, num_tokens=len(prompt_tokens) + 10)
         tokens = Tensor([prompt_tokens], dtype=dtypes.int32).realize()
         _ = model.prefill(tokens, kv_cache=kv_cache, block_manager=block_manager, seq_id=0)
 
@@ -281,7 +290,7 @@ class TestJitWarmup:
 
         # Prefill
         prompt_tokens = [1, 2, 3, 4, 5]
-        block_manager.allocate_sequence(seq_id=0, num_tokens=len(prompt_tokens) + 10)
+        _setup_seq(block_manager, seq_id=0, num_tokens=len(prompt_tokens) + 10)
         tokens = Tensor([prompt_tokens], dtype=dtypes.int32).realize()
         _ = model.prefill(tokens, kv_cache=kv_cache, block_manager=block_manager, seq_id=0)
 

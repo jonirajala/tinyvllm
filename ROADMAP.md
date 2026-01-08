@@ -41,18 +41,29 @@ Sample all sequences in batch together instead of loop.
 - Mixed greedy/random combining via `Tensor.where()`
 - Conditional fast paths (skip ops when all params uniform)
 
-### 1.4 Incremental Block Allocation
+### 1.4 Incremental Block Allocation ✅ DONE
 **Impact:** 30-50% memory savings | **Effort:** Low | **Source:** [vLLM PagedAttention](https://blog.vllm.ai/2025/09/05/anatomy-of-vllm.html)
 
-Current approach pre-allocates all blocks upfront (wastes 60-80% memory).
-vLLM allocates blocks incrementally as tokens are generated.
+Blocks allocated on-demand as tokens are generated, not pre-allocated upfront.
 
-- Use `get_slot()` instead of pre-allocating full sequence length
-- Only grab new block when current block is full
-- Enables more concurrent sequences with same memory
+**Implemented:** `register_sequence()` creates entry without blocks. Model's inline allocation in `llama.py` handles the rest via `ensure_block_for_position()` and `get_slot()`.
 
-**Already implemented:** `block_manager.get_slot()` exists but unused.
-**TODO:** Refactor engine to use incremental allocation.
+### 1.5 Auto Memory Profiling
+**Impact:** Better usability | **Effort:** Low | **Source:** [vLLM](https://deepwiki.com/unslothai/vllm/3.3-memory-management-and-kv-cache)
+
+**What it does:**
+- At startup, run dummy forward pass to measure model memory
+- Calculate: `available = total_gpu * utilization - model_memory`
+- Auto-compute `num_blocks = available / block_memory_size`
+
+**Current:** Manual configuration of `blocks_per_gpu` required.
+
+**vLLM approach:**
+```python
+# Profile peak memory with dummy inputs
+# Default gpu_memory_utilization = 0.9
+num_blocks = (gpu_memory * 0.9 - model_footprint) / block_size_bytes
+```
 
 ---
 
@@ -131,6 +142,22 @@ Process multiple prefill sequences together when lengths similar.
 **Impact:** 2x, no separate model | **Effort:** Medium
 
 Add small prediction heads to main model instead of separate draft model.
+
+### 4.3 Lookahead Slots
+**Impact:** Enables speculative decoding | **Effort:** Low | **Source:** [vLLM BlockSpaceManager](https://docs.vllm.ai/en/stable/api/vllm/vllm.core.block_manager.html)
+
+**What it does:**
+- Pre-allocate extra slots beyond known tokens
+- Used by speculative decoding to store draft tokens before verification
+- Contents undefined until verification completes
+
+**Implementation:**
+```python
+def can_append_slots(seq_group, num_lookahead_slots):
+    """Check if space exists for known tokens + lookahead."""
+    # Worst-case: each touched block needs new allocation
+    return num_touched_blocks < num_free_blocks
+```
 
 ---
 
@@ -213,7 +240,27 @@ Different layers on different GPUs, pipeline micro-batches.
 
 ## Phase 8: Memory Management
 
-### 8.1 Preemption & Recompute
+### 8.1 Watermarks
+**Impact:** Prevent thrashing | **Effort:** Low | **Source:** [vLLM](https://github.com/vllm-project/vllm/discussions/263)
+
+**What it does:**
+- Low watermark: Start swapping out/preempting sequences
+- High watermark: Stop accepting new requests until memory freed
+
+**Why needed:**
+- Prevents frequent preemptions from accepting too many requests
+- Ensures running sequences can progress to completion
+- Avoids OOM by proactively managing memory pressure
+
+**vLLM defaults:**
+```python
+gpu_memory_utilization = 0.9  # High watermark
+# Low watermark triggers swap-out before hitting limit
+```
+
+**Current:** tinyvllm fails with `RuntimeError("Out of KV cache memory!")` - no graceful handling.
+
+### 8.2 Preemption & Recompute
 **Impact:** Handle memory pressure | **Effort:** Medium
 
 When OOM:
@@ -221,18 +268,19 @@ When OOM:
 - Free its KV blocks
 - Recompute later when memory available
 
-### 8.2 CPU Offload
+### 8.3 CPU Offload (Swapping)
 **Impact:** Longer contexts | **Effort:** High
 
 - Swap inactive KV blocks to CPU
 - Async transfers to hide latency
 - Bring back when needed
 
-### 8.3 KV Cache Compression
+### 8.4 KV Cache Compression
 **Impact:** 2-4x longer contexts | **Effort:** Medium
 
-- Quantize KV cache to INT8
-- Or use lower precision (FP8 on supported hardware)
+- Quantize KV cache to INT8/FP8
+- vLLM: FP8_E5M2 (NVIDIA) or FP8_E4M3 (AMD)
+- ~50% memory reduction with minimal quality loss
 
 ---
 
@@ -273,21 +321,24 @@ QUICK WINS (do first):
 ├── 1.1 Buffer reuse                     ~15% ✅ DONE
 ├── 1.2 Object pooling                   ~10% ✅ DONE
 ├── 1.3 Batched sampling                 ~5% ✅ DONE
-└── 1.4 Incremental block allocation     ~40% memory
+├── 1.4 Incremental block allocation     ~40% memory ✅ DONE
+└── 1.5 Auto memory profiling            usability
 
 HIGH IMPACT (do next):
 ├── 2.1 Chunked prefill                  ~50% throughput
 ├── 3.1 Prefix caching (APC)             2-5x for cache hits
-└── 5.1 HTTP server                      usability
+├── 5.1 HTTP server                      usability
+└── 8.1 Watermarks                       prevent OOM
 
 MEDIUM IMPACT (later):
 ├── 4.1 Speculative decoding             2-3x
+├── 4.3 Lookahead slots                  enables spec decode
 ├── 6.1 Quantization                     2-4x memory
 └── 5.2 Structured output                usability
 
 ADVANCED (someday):
 ├── 7.x Multi-GPU                        larger models
-├── 8.x Memory management                longer contexts
+├── 8.x Memory management                graceful degradation
 └── 9.x More models                      broader support
 ```
 
@@ -296,9 +347,14 @@ ADVANCED (someday):
 ## References
 
 - [vLLM V1 Architecture](https://blog.vllm.ai/2025/01/27/v1-alpha-release.html)
+- [vLLM PagedAttention Blog](https://blog.vllm.ai/2023/06/20/vllm.html)
+- [vLLM Block Manager API](https://docs.vllm.ai/en/stable/api/vllm/vllm.core.block_manager.html)
 - [vLLM Chunked Prefill](https://docs.vllm.ai/en/stable/configuration/optimization/)
-- [SGLang RadixAttention](https://lmsys.org/blog/2024-01-17-sglang/)
 - [vLLM Speculative Decoding](https://docs.vllm.ai/en/latest/features/spec_decode/)
+- [vLLM Watermarks Discussion](https://github.com/vllm-project/vllm/discussions/263)
+- [SGLang RadixAttention](https://lmsys.org/blog/2024-01-17-sglang/)
 - [DistServe: Disaggregated Prefill/Decode](https://www.usenix.org/system/files/osdi24-zhong-yinmin.pdf)
+- [DeepWiki: vLLM KV Cache Management](https://deepwiki.com/hao-ai-lab/vllm-ltr/2.3-kv-cache-management)
+- [DeepWiki: vLLM Memory Management](https://deepwiki.com/unslothai/vllm/3.3-memory-management-and-kv-cache)
 - [TensorRT-LLM](https://nvidia.github.io/TensorRT-LLM/)
 - [llama.cpp](https://github.com/ggerganov/llama.cpp)

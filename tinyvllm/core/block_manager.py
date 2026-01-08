@@ -1,7 +1,6 @@
 """Block Manager - Centralized KV cache block allocation across GPUs."""
 
 from typing import Dict, List, Optional, Tuple
-from math import ceil
 
 
 class BlockManager:
@@ -22,43 +21,29 @@ class BlockManager:
         self.block_tables: Dict[int, List[int]] = {}
         self.seq_positions: Dict[int, int] = {}
 
-    def allocate_sequence(self, seq_id: int, num_tokens: int) -> int:
-        """Allocate blocks for a new sequence. Returns gpu_id."""
-        blocks_needed = ceil(num_tokens / self.block_size)
-
-        free_blocks_per_gpu = {gpu_id: len(self.free_blocks[gpu_id]) for gpu_id in self.free_blocks}
-        max_free_blocks_gpu = max(free_blocks_per_gpu, key=free_blocks_per_gpu.get)
-
-        if free_blocks_per_gpu[max_free_blocks_gpu] < blocks_needed:
-            raise RuntimeError(f"Not enough free blocks on GPU {max_free_blocks_gpu}")
-
-        blocks = [self.free_blocks[max_free_blocks_gpu].pop() for _ in range(blocks_needed)]
-        for block in blocks:
-            self.ref_counts[max_free_blocks_gpu][block] = 1
-
-        self.block_tables[seq_id] = blocks
-        self.seq_to_gpu[seq_id] = max_free_blocks_gpu
+    def register_sequence(self, seq_id: int, gpu_id: int = 0) -> None:
+        """Register sequence without allocating blocks. Blocks allocated on-demand."""
+        self.seq_to_gpu[seq_id] = gpu_id
+        self.block_tables[seq_id] = []
         self.seq_positions[seq_id] = 0
-        return max_free_blocks_gpu
 
-    def get_slot(self, seq_id: int) -> Tuple[int, int, int]:
-        """
-        Get (gpu_id, block_id, offset) for next token write. Allocates new block if needed.
-        TODO: Use this instead of allocate_sequence.
-        """
-        pos = self.seq_positions[seq_id]
-        logical_block = pos // self.block_size
-        offset = pos % self.block_size
-
-        if logical_block >= len(self.block_tables[seq_id]):
+    def ensure_block_for_position(self, seq_id: int, pos: int) -> int:
+        """Ensure a block exists for the given position. Returns block_id."""
+        block_idx = pos // self.block_size
+        while len(self.block_tables[seq_id]) <= block_idx:
             gpu_id = self.seq_to_gpu[seq_id]
             if len(self.free_blocks[gpu_id]) == 0:
                 raise RuntimeError("Out of KV cache memory!")
             new_block = self.free_blocks[gpu_id].pop()
             self.ref_counts[gpu_id][new_block] = 1
             self.block_tables[seq_id].append(new_block)
+        return self.block_tables[seq_id][block_idx]
 
-        return (self.seq_to_gpu[seq_id], self.block_tables[seq_id][logical_block], offset)
+    def get_slot(self, seq_id: int) -> Tuple[int, int, int]:
+        """Get (gpu_id, block_id, offset) for next token write. Allocates new block if needed."""
+        pos = self.seq_positions[seq_id]
+        block_id = self.ensure_block_for_position(seq_id, pos)
+        return (self.seq_to_gpu[seq_id], block_id, pos % self.block_size)
 
     def advance_position(self, seq_id: int) -> None:
         """Increment position after writing K/V for one token across all layers."""
@@ -94,13 +79,6 @@ class BlockManager:
         if gpu_id is None:
             return sum(len(blocks) for blocks in self.free_blocks.values())
         return len(self.free_blocks[gpu_id])
-
-    def can_allocate(self, num_tokens: int) -> bool:
-        """Check if any GPU has enough free blocks for num_tokens."""
-        return any(
-            len(self.free_blocks[gpu]) >= ceil(num_tokens / self.block_size)
-            for gpu in range(self.num_gpus)
-        )
 
     def fork_sequence(self, src_seq_id: int, dst_seq_id: int) -> None:
         """Fork sequence for beam search. Shares blocks via ref counting."""
