@@ -1,10 +1,4 @@
-"""
-TinyVLLM CLI - Run LLM inference with continuous batching.
-
-Usage:
-    python -m tinyvllm.main --model /path/to/llama --prompt "Hello"
-    echo "Hello" | python -m tinyvllm.main --model /path/to/llama
-"""
+"""TinyVLLM CLI - LLM inference with continuous batching."""
 
 import argparse
 import sys
@@ -18,7 +12,7 @@ from tinyvllm.core.sampling import SamplingParams
 from tinyvllm.core.engine import LLMEngine
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="TinyVLLM - Minimal LLM inference")
     parser.add_argument("--model", type=str, required=True, help="Path to model directory")
     parser.add_argument("--prompt", type=str, help="Text to complete (reads from stdin if not provided)")
@@ -30,17 +24,14 @@ def main():
     parser.add_argument("--device", type=str, help="Device to run on (CPU, CUDA, METAL)")
     parser.add_argument("--num-scheduler-steps", type=int, default=4,
                         help="Decode steps per scheduler cycle (1=low latency, 4+=high throughput)")
-    parser.add_argument("--no-async-output", action="store_true",
-                        help="Disable async output processing (enabled by default)")
+    parser.add_argument("--no-async-output", action="store_true", help="Disable async output processing")
     args = parser.parse_args()
 
-    # Set device if specified
     if args.device:
         Device.DEFAULT = args.device.upper()
 
     print(f"Using device: {Device.DEFAULT}", file=sys.stderr)
 
-    # Get prompt from argument or stdin
     if args.prompt:
         prompt = args.prompt
     else:
@@ -49,19 +40,16 @@ def main():
             print("Error: No prompt provided", file=sys.stderr)
             sys.exit(1)
 
-    # Load model
     config, weights = load_llama_weights(args.model)
     model = create_llama(config, weights)
     tokenizer = load_tokenizer(args.model)
 
-    # Create engine
     engine = LLMEngine(
         model, tokenizer,
         num_scheduler_steps=args.num_scheduler_steps,
         async_output=not args.no_async_output,
     )
 
-    # Create sampling params
     params = SamplingParams(
         max_tokens=args.max_tokens,
         temperature=args.temperature,
@@ -70,7 +58,6 @@ def main():
         repetition_penalty=args.repetition_penalty,
     )
 
-    # Add request and run
     engine.add_request(prompt, params)
 
     for output in engine.run():

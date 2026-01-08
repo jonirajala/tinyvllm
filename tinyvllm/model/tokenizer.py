@@ -1,22 +1,18 @@
 """Tokenizer wrapper for LLaMA models."""
 
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 import json
-import struct
 
 
 class BPETokenizer:
-    """
-    Simple BPE tokenizer for LLaMA models.
-    Supports loading from tokenizer.json (HuggingFace format) or tokenizer.model (SentencePiece).
-    """
+    """BPE tokenizer supporting HuggingFace tokenizer.json format."""
 
     def __init__(
         self,
-        vocab: dict[str, int],
-        merges: List[tuple[str, str]],
-        special_tokens: dict[str, int] = None,
+        vocab: Dict[str, int],
+        merges: List[Tuple[str, str]],
+        special_tokens: Optional[Dict[str, int]] = None,
     ):
         self.vocab = vocab
         self.vocab_inv = {v: k for k, v in vocab.items()}
@@ -24,14 +20,12 @@ class BPETokenizer:
         self.special_tokens = special_tokens or {}
         self.special_tokens_inv = {v: k for k, v in self.special_tokens.items()}
 
-        # Common special token IDs
         self.bos_id = self.special_tokens.get("<s>", self.special_tokens.get("<|begin_of_text|>", 1))
         self.eos_id = self.special_tokens.get("</s>", self.special_tokens.get("<|end_of_text|>", 2))
         self.pad_id = self.special_tokens.get("<pad>", 0)
 
     def encode(self, text: str, add_bos: bool = True, add_eos: bool = False) -> List[int]:
         """Encode text to token IDs."""
-        # Handle special tokens first
         for special, id in self.special_tokens.items():
             if special in text:
                 parts = text.split(special)
@@ -54,14 +48,11 @@ class BPETokenizer:
         return tokens
 
     def _encode_piece(self, text: str) -> List[int]:
-        """Encode a piece of text without special tokens."""
-        # Convert to bytes and then to initial tokens
+        """Encode text without special tokens using BPE merges."""
         text_bytes = text.encode("utf-8")
         tokens = [self.vocab.get(bytes([b]).decode("utf-8", errors="replace"), 0) for b in text_bytes]
 
-        # Apply BPE merges
         while len(tokens) >= 2:
-            # Find the pair with lowest merge rank
             min_rank = float("inf")
             min_idx = -1
 
@@ -76,11 +67,10 @@ class BPETokenizer:
             if min_idx == -1:
                 break
 
-            # Merge the pair
             pair = (self.vocab_inv.get(tokens[min_idx], ""), self.vocab_inv.get(tokens[min_idx + 1], ""))
             merged = pair[0] + pair[1]
             merged_id = self.vocab.get(merged, tokens[min_idx])
-            tokens = tokens[:min_idx] + [merged_id] + tokens[min_idx + 2 :]
+            tokens = tokens[:min_idx] + [merged_id] + tokens[min_idx + 2:]
 
         return tokens
 
@@ -94,7 +84,6 @@ class BPETokenizer:
             pieces.append(piece)
 
         text = "".join(pieces)
-        # Handle byte-level encoding
         try:
             return text.encode("latin-1").decode("utf-8")
         except (UnicodeDecodeError, UnicodeEncodeError):
@@ -106,7 +95,7 @@ class BPETokenizer:
 
 
 class SentencePieceTokenizer:
-    """Wrapper for SentencePiece tokenizer (tokenizer.model format)."""
+    """Wrapper for SentencePiece tokenizer.model format."""
 
     def __init__(self, model_path: Path):
         try:
@@ -141,7 +130,6 @@ class SentencePieceTokenizer:
         if token in (self.bos_id, self.eos_id, self.pad_id):
             return ""
         piece = self.sp.IdToPiece(token)
-        # SentencePiece uses ▁ (U+2581) to represent space
         return piece.replace("▁", " ")
 
     @property
@@ -150,7 +138,7 @@ class SentencePieceTokenizer:
 
 
 class TiktokenTokenizer:
-    """Wrapper for tiktoken (used by newer LLaMA models)."""
+    """Wrapper for tiktoken (newer LLaMA models)."""
 
     def __init__(self, encoding_name: str = "cl100k_base"):
         try:
@@ -184,18 +172,10 @@ class TiktokenTokenizer:
 
 
 def load_tokenizer(path: Union[str, Path]) -> Union[BPETokenizer, SentencePieceTokenizer, TiktokenTokenizer]:
-    """
-    Load a tokenizer from a file or directory.
-
-    Supports:
-    - tokenizer.json (HuggingFace format)
-    - tokenizer.model (SentencePiece format)
-    - Directory containing either
-    """
+    """Load tokenizer from file or directory. Supports tokenizer.json and tokenizer.model."""
     path = Path(path)
 
     if path.is_dir():
-        # Check for tokenizer files - prefer SentencePiece for LLaMA models
         if (path / "tokenizer.model").exists():
             return SentencePieceTokenizer(path / "tokenizer.model")
         elif (path / "tokenizer.json").exists():
@@ -216,14 +196,12 @@ def _load_hf_tokenizer(path: Path) -> BPETokenizer:
     with open(path) as f:
         data = json.load(f)
 
-    # Extract vocab
     vocab = {}
     if "model" in data and "vocab" in data["model"]:
         vocab = data["model"]["vocab"]
     elif "vocab" in data:
         vocab = data["vocab"]
 
-    # Extract merges
     merges = []
     if "model" in data and "merges" in data["model"]:
         for merge in data["model"]["merges"]:
@@ -234,7 +212,6 @@ def _load_hf_tokenizer(path: Path) -> BPETokenizer:
             elif isinstance(merge, list) and len(merge) == 2:
                 merges.append(tuple(merge))
 
-    # Extract special tokens
     special_tokens = {}
     if "added_tokens" in data:
         for token in data["added_tokens"]:
