@@ -12,6 +12,7 @@ from .kv_cache import KVCache
 from .sampling import SamplingParams, sample_tokens
 from .output_processor import OutputProcessor
 from .pool import ObjectPool
+from .memory import auto_num_blocks
 
 if TYPE_CHECKING:
     from ..model.llama import Llama
@@ -34,17 +35,21 @@ class LLMEngine:
         model: "Llama",
         tokenizer: Any,
         max_batch_size: int = 8,
-        num_blocks: int = 100,
+        num_blocks: Optional[int] = None,
         block_size: int = 16,
         num_scheduler_steps: int = 1,
         async_output: bool = False,
         output_callback: Optional[Callable[[GenerationOutput], None]] = None,
+        gpu_memory_utilization: float = 0.9,
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.max_batch_size = max_batch_size
         self.block_size = block_size
         self.num_scheduler_steps = num_scheduler_steps
+
+        # Auto-calculate num_blocks if not specified
+        if num_blocks is None: num_blocks = auto_num_blocks(model.config, block_size, gpu_memory_utilization)
 
         self.block_manager = BlockManager(
             num_gpus=1,

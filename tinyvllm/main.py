@@ -25,6 +25,10 @@ def main() -> None:
     parser.add_argument("--num-scheduler-steps", type=int, default=4,
                         help="Decode steps per scheduler cycle (1=low latency, 4+=high throughput)")
     parser.add_argument("--no-async-output", action="store_true", help="Disable async output processing")
+    parser.add_argument("--num-blocks", type=int, default=None,
+                        help="KV cache blocks (auto-calculated if not set)")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9,
+                        help="Fraction of GPU memory to use (default: 0.9)")
     args = parser.parse_args()
 
     if args.device:
@@ -48,6 +52,8 @@ def main() -> None:
         model, tokenizer,
         num_scheduler_steps=args.num_scheduler_steps,
         async_output=not args.no_async_output,
+        num_blocks=args.num_blocks,
+        gpu_memory_utilization=args.gpu_memory_utilization,
     )
 
     params = SamplingParams(

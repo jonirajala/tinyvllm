@@ -143,7 +143,7 @@ class TestMemoryBaseline:
         """KV cache memory should be predictable."""
         model, config = create_test_model()
         tokenizer = MockTokenizer(vocab_size=config.vocab_size)
-        engine = LLMEngine(model, tokenizer)
+        engine = LLMEngine(model, tokenizer, num_blocks=100)
 
         params = SamplingParams(max_tokens=5, temperature=0.0)
         engine.add_request("test", params)
@@ -164,7 +164,7 @@ class TestMemoryBaseline:
 
         memories = []
         for batch_size in [1, 2, 4]:
-            engine = LLMEngine(model, tokenizer, max_batch_size=batch_size)
+            engine = LLMEngine(model, tokenizer, max_batch_size=batch_size, num_blocks=100)
             params = SamplingParams(max_tokens=5, temperature=0.0)
 
             for i in range(batch_size):

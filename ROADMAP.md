@@ -48,21 +48,26 @@ Blocks allocated on-demand as tokens are generated, not pre-allocated upfront.
 
 **Implemented:** `register_sequence()` creates entry without blocks. Model's inline allocation in `llama.py` handles the rest via `ensure_block_for_position()` and `get_slot()`.
 
-### 1.5 Auto Memory Profiling
+### 1.5 Auto Memory Profiling ✅ DONE
 **Impact:** Better usability | **Effort:** Low | **Source:** [vLLM](https://deepwiki.com/unslothai/vllm/3.3-memory-management-and-kv-cache)
 
-**What it does:**
-- At startup, run dummy forward pass to measure model memory
-- Calculate: `available = total_gpu * utilization - model_memory`
-- Auto-compute `num_blocks = available / block_memory_size`
+At startup, automatically calculate `num_blocks` based on available GPU memory.
 
-**Current:** Manual configuration of `blocks_per_gpu` required.
+**Implemented:**
+- `memory.py`: GPU detection (Metal/CUDA), `forward_profile()` for model footprint, `auto_num_blocks()`
+- `engine.py`: Auto-calculates when `num_blocks=None` (default)
+- `main.py`: `--num-blocks` and `--gpu-memory-utilization` CLI args
 
-**vLLM approach:**
-```python
-# Profile peak memory with dummy inputs
-# Default gpu_memory_utilization = 0.9
-num_blocks = (gpu_memory * 0.9 - model_footprint) / block_size_bytes
+**Usage:**
+```bash
+# Auto-configure (default)
+python -m tinyvllm.main --model ~/models/TinyLlama
+
+# Manual override
+python -m tinyvllm.main --model ~/models/TinyLlama --num-blocks 500
+
+# Adjust utilization
+python -m tinyvllm.main --model ~/models/TinyLlama --gpu-memory-utilization 0.8
 ```
 
 ---
@@ -322,7 +327,7 @@ QUICK WINS (do first):
 ├── 1.2 Object pooling                   ~10% ✅ DONE
 ├── 1.3 Batched sampling                 ~5% ✅ DONE
 ├── 1.4 Incremental block allocation     ~40% memory ✅ DONE
-└── 1.5 Auto memory profiling            usability
+└── 1.5 Auto memory profiling            usability ✅ DONE
 
 HIGH IMPACT (do next):
 ├── 2.1 Chunked prefill                  ~50% throughput
